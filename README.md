@@ -1,122 +1,151 @@
-#PDF Table Extractor to Excel
+# PDF Table Extractor to Excel
 
-This package contains a local Python tool that takes a PDF as input and writes only the detected tables into an Excel workbook.
+A command-line Python tool that extracts tabular data from PDF documents and exports results to a structured Excel workbook.
 
-##What it does
+This project is designed for practical workflows where PDFs can be either:
+- **Text-based** (machine-readable), or
+- **Scanned/image-based** (OCR required).
 
-- Reads a PDF file
-- Detects whether the PDF is mainly text based or scanned
-- Tries table extraction with free Python libraries
-- Writes each extracted table to its own Excel sheet
-- Adds a `_summary` sheet with page number, extraction engine, and basic metadata
+---
 
-##Why this design
+## Features
 
-Existing free tools already cover most of the hard work:
+- Extracts tables from a PDF into a single `.xlsx` file.
+- Supports multiple extraction backends:
+  - `camelot` (strong for structured, text-based PDFs)
+  - `pdfplumber` (reliable fallback for text PDFs)
+  - `img2table` (useful for scanned/OCR workflows)
+- Automatic backend selection with manual override.
+- Page-range targeting (`all`, single pages, lists, and ranges).
+- Quality filters for extracted tables (row/column thresholds, fill ratio, accuracy).
+- Optional OCR tuning for scanned Chinese documents.
+- Adds a `_summary` worksheet with extraction metadata.
 
-- `Camelot` is strong for text based PDFs with clear table structure
-- `pdfplumber` is a good fallback when Camelot misses tables
-- `img2table` is useful for scanned PDFs and OCR based workflows
+---
 
-So this script does not reimplement table recognition from scratch. It wraps the best free options into one command line tool.
+## Project Structure
 
-##Files
+- `pdf_table_extractor.py` — main CLI script
+- `requirements.txt` — Python dependencies
+- `training/` — sample/training PDFs
 
-- `pdf_table_extractor.py` : main script
-- `requirements.txt` : Python dependencies
-#======
-#Step 1
-#======
-##Install
+---
 
-###Base install
+## Installation
 
-```
+### 1) Install Python dependencies
+
+```bash
 pip install -r requirements.txt
 ```
 
-###Optional OCR support for scanned PDFs
+### 2) Optional: OCR support for scanned PDFs
 
-```
+```bash
 pip install img2table
 ```
 
-If you want OCR with Tesseract, install Tesseract on your machine as well.
+If you plan to use OCR via `img2table`, install **Tesseract OCR** on your system.
 
-```
+Example (Windows):
+
+```bash
 winget install --id UB-Mannheim.TesseractOCR
 ```
 
+---
 
-#======
-#Step 2
-#======
+## Usage
 
-##Usage
+### Basic
 
-###Basic
-
-```
+```bash
 python pdf_table_extractor.py input.pdf
 ```
 
-This writes:
+Default output:
 
-```
+```text
 input_tables.xlsx
 ```
 
-###Choose output path
+### Specify output file
 
-```
+```bash
 python pdf_table_extractor.py input.pdf -o output.xlsx
 ```
 
-###Process only some pages
+### Process selected pages
 
-```
+```bash
 python pdf_table_extractor.py input.pdf --pages 1-3,5
 ```
 
-###Force a specific tool
+### Select extraction backend
 
-```
+```bash
+python pdf_table_extractor.py input.pdf --mode auto
 python pdf_table_extractor.py input.pdf --mode camelot
 python pdf_table_extractor.py input.pdf --mode pdfplumber
 python pdf_table_extractor.py input.pdf --mode img2table
 ```
 
-###Verbose logging
+### Verbose mode
 
-```
+```bash
 python pdf_table_extractor.py input.pdf --verbose
 ```
 
-##Notes
+---
 
-- For text based PDFs, `Camelot` usually performs best.
-- For scanned PDFs, install `img2table` and OCR support.
-- If a table is not detected well, try changing pages, forcing a backend, or lowering thresholds.
+## CLI Options (Reference)
 
-##Useful options
-
+```text
+-h, --help
+-o, --output
+--pages
+--mode {auto,camelot,pdfplumber,img2table}
+--prefer {stream,lattice,both}
+--min-rows
+--min-cols
+--min-filled-ratio
+--accuracy-threshold
+--ocr-lang
+--ocr-lang-auto
+--borderless
+--img2table-min-confidence
+--verbose
 ```
---ocr-lang eng
-```
 
-##Output structure
+---
 
-The Excel workbook contains:
+## Output Format
 
-- one sheet per extracted table, named `Table_001`, `Table_002`, etc.
-- one `_summary` sheet listing page, engine, score, rows, and columns
+The generated Excel workbook contains:
 
-##Example use
+- `Table_001`, `Table_002`, ... — one worksheet per extracted table
+- `_summary` — page number, extraction engine, score/quality indicators, and table shape metadata
 
-```
+---
+
+## Practical Notes
+
+- For text-based PDFs, `camelot` is usually the best first choice.
+- For scanned PDFs, `img2table` + Tesseract OCR is recommended.
+- If extraction quality is low, try:
+  - restricting pages with `--pages`
+  - forcing a different backend with `--mode`
+  - adjusting thresholds (`--min-filled-ratio`, `--accuracy-threshold`)
+  - lowering `--img2table-min-confidence` for noisy scans
+
+Example (multilingual OCR):
+
+```bash
 python pdf_table_extractor.py financial_report.pdf -o financial_tables.xlsx --ocr-lang "chi_sim+eng"
 ```
 
-##Issues need to be fixed
+---
 
-Chinese scanned pdfs do not have an accurate output
+## Known Limitation
+
+- Accuracy on heavily degraded Chinese scanned PDFs can still vary depending on image quality and OCR configuration.
