@@ -57,7 +57,7 @@ winget install --id UB-Mannheim.TesseractOCR
 
 ## Usage
 
-### Basic
+### Basic (beginner mode)
 
 ```bash
 python pdf_table_extractor.py input.pdf
@@ -69,10 +69,29 @@ Default output:
 input_tables.xlsx
 ```
 
-### Specify output file
+You can also pass a folder to process all PDFs inside it:
+
+```bash
+python pdf_table_extractor.py ./pdfs
+```
+
+Default batch output folder:
+
+```text
+./pdfs/extracted_tables/
+```
+
+### Specify output file (single PDF)
 
 ```bash
 python pdf_table_extractor.py input.pdf -o output.xlsx
+```
+
+### Specify output folder (single PDF or batch)
+
+```bash
+python pdf_table_extractor.py input.pdf --output-dir ./out
+python pdf_table_extractor.py ./pdfs --output-dir ./out
 ```
 
 ### Process selected pages
@@ -103,6 +122,7 @@ python pdf_table_extractor.py input.pdf --verbose
 ```text
 -h, --help
 -o, --output
+--output-dir
 --pages
 --mode {auto,camelot,pdfplumber,img2table}
 --prefer {stream,lattice,both}

@@ -34,13 +34,23 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Extract tables from a PDF and write them to an Excel workbook."
     )
-    parser.add_argument("input_pdf", type=Path, help="Path to the input PDF")
+    parser.add_argument(
+        "input_path",
+        type=Path,
+        help="Path to a PDF file or a folder that contains PDF files",
+    )
     parser.add_argument(
         "-o",
         "--output",
         type=Path,
         default=None,
-        help="Path to output .xlsx file. Defaults to <input_stem>_tables.xlsx",
+        help="Output .xlsx path for single-file input only",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Output directory for batch/folder input. Defaults to <input_folder>/extracted_tables",
     )
     parser.add_argument(
         "--pages",
@@ -110,6 +120,19 @@ def parse_args() -> argparse.Namespace:
         help="Print extraction progress",
     )
     return parser.parse_args()
+
+
+def collect_input_pdfs(input_path: Path) -> List[Path]:
+    if input_path.is_file():
+        if input_path.suffix.lower() != ".pdf":
+            raise ValueError(f"Input file is not a PDF: {input_path}")
+        return [input_path]
+
+    if input_path.is_dir():
+        pdfs = sorted(p for p in input_path.iterdir() if p.is_file() and p.suffix.lower() == ".pdf")
+        return pdfs
+
+    raise ValueError(f"Input path does not exist: {input_path}")
 
 #Only print log when verbose is true
 def log(message: str, verbose: bool = True) -> None:
@@ -574,17 +597,9 @@ def write_excel(output_path: Path, tables: Sequence[ExtractedTable]) -> None:
             sheet.freeze_panes = "A2"
 
 
-def main() -> int:
-    args = parse_args()
-    input_pdf: Path = args.input_pdf
+def extract_tables_for_pdf(input_pdf: Path, args: argparse.Namespace) -> List[ExtractedTable]:
     if not input_pdf.exists():
-        print(f"Input PDF not found: {input_pdf}", file=sys.stderr)
-        return 1
-
-    if args.output is None:
-        output_path = input_pdf.with_name(f"{input_pdf.stem}_tables.xlsx")
-    else:
-        output_path = args.output
+        raise FileNotFoundError(f"Input PDF not found: {input_pdf}")
 
     try:
         doc = fitz.open(str(input_pdf))
@@ -592,15 +607,13 @@ def main() -> int:
         doc.close()
         pages = expand_page_ranges(args.pages, max_pages)
     except Exception as exc:
-        print(f"Failed to read PDF metadata: {exc}", file=sys.stderr)
-        return 1
+        raise RuntimeError(f"Failed to read PDF metadata for {input_pdf}: {exc}") from exc
 
     if not pages:
-        print("No valid pages selected.", file=sys.stderr)
-        return 1
+        raise ValueError(f"No valid pages selected for {input_pdf}.")
 
     pdf_kind = detect_pdf_kind(input_pdf)
-    log(f"Detected PDF type: {pdf_kind}", args.verbose)
+    log(f"[{input_pdf.name}] Detected PDF type: {pdf_kind}", args.verbose)
     ocr_auto_tune = args.ocr_lang_auto
 
     ocr_lang = args.ocr_lang
@@ -734,23 +747,72 @@ def main() -> int:
                     args.min_cols,
                     args.min_filled_ratio,
                     args.verbose,
+                    )
                 )
-            )
 
-    extracted = deduplicate_tables(extracted)
+    return deduplicate_tables(extracted)
 
-    if not extracted:
-        print(
-            (
-                "No tables were extracted. If the PDF is scanned, install img2table and OCR support, "
-                "then retry with --mode img2table --ocr-lang-auto --verbose."
-            ),
-            file=sys.stderr,
-        )
+
+def build_output_path(args: argparse.Namespace, input_pdf: Path, batch_mode: bool) -> Path:
+    if not batch_mode and args.output is not None:
+        return args.output
+
+    if batch_mode:
+        output_dir = args.output_dir or args.input_path / "extracted_tables"
+        return output_dir / f"{input_pdf.stem}_tables.xlsx"
+
+    if args.output_dir is not None:
+        return args.output_dir / f"{input_pdf.stem}_tables.xlsx"
+
+    return input_pdf.with_name(f"{input_pdf.stem}_tables.xlsx")
+
+
+def main() -> int:
+    args = parse_args()
+
+    if args.output is not None and args.output_dir is not None:
+        print("Use either --output or --output-dir, not both.", file=sys.stderr)
+        return 1
+
+    try:
+        input_pdfs = collect_input_pdfs(args.input_path)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if not input_pdfs:
+        print(f"No PDF files found in: {args.input_path}", file=sys.stderr)
+        return 1
+
+    if len(input_pdfs) > 1 and args.output is not None:
+        print("--output can only be used with a single PDF input.", file=sys.stderr)
+        return 1
+
+    batch_mode = len(input_pdfs) > 1 or args.input_path.is_dir()
+    failures = 0
+
+    for input_pdf in input_pdfs:
+        try:
+            extracted = extract_tables_for_pdf(input_pdf, args)
+            if not extracted:
+                print(
+                    (
+                        f"No tables extracted from {input_pdf.name}. If scanned, install img2table and OCR support, "
+                        "then retry with --mode img2table --ocr-lang-auto --verbose."
+                    ),
+                    file=sys.stderr,
+                )
+                failures += 1
+                continue
+            output_path = build_output_path(args, input_pdf, batch_mode)
+            write_excel(output_path, extracted)
+            print(f"[OK] {input_pdf.name}: saved {len(extracted)} table(s) to {output_path}")
+        except Exception as exc:
+            print(f"[FAILED] {input_pdf}: {exc}", file=sys.stderr)
+            failures += 1
+
+    if failures == len(input_pdfs):
         return 2
-
-    write_excel(output_path, extracted)
-    print(f"Saved {len(extracted)} table(s) to {output_path}")
     return 0
 
 
