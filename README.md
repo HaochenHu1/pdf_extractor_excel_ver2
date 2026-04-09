@@ -208,3 +208,13 @@ Evaluate with:
 ```bash
 python training/eval_merge_quality.py <path_to_json_or_jsonl_or_directory>
 ```
+
+### Profile tuning (offline)
+
+Use the offline tuner to search small merge-profile grids against your regression set:
+
+```bash
+python training/tune_merge_profiles.py --input <path_to_json_or_jsonl_or_directory> --topk 10 --precision-floor 0.90
+```
+
+`tune_merge_profiles.py` does **not** modify runtime constants by default. Even with `--apply`, it only writes a suggested profile artifact file.
