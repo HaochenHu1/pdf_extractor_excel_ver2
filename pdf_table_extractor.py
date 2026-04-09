@@ -4,6 +4,7 @@ import argparse
 import re
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -518,6 +519,49 @@ def infer_merged_regions(extracted_table: ExtractedTable) -> List[Dict[str, obje
     return merged
 
 
+def sanitize_merge_reject_reason(reason: object, max_len: int = 40) -> str:
+    text = str(reason or "").lower()
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    text = re.sub(r"\s+", "_", text.strip())
+    text = re.sub(r"[^a-z0-9_]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    if not text:
+        return "unknown"
+    return text[:max_len]
+
+
+def format_merge_reject_top_reasons(raw_reasons: object, max_distinct: int = 5) -> str:
+    if max_distinct <= 0:
+        return ""
+
+    flattened: List[object] = []
+    if isinstance(raw_reasons, str):
+        flattened.extend(part for part in raw_reasons.split(",") if part.strip())
+    elif isinstance(raw_reasons, (list, tuple, set)):
+        for item in raw_reasons:
+            if isinstance(item, dict):
+                flattened.append(item.get("reason", ""))
+            else:
+                flattened.append(item)
+    elif isinstance(raw_reasons, dict):
+        flattened.append(raw_reasons.get("reason", ""))
+
+    if not flattened:
+        return ""
+
+    counts: Counter[str] = Counter()
+    for item in flattened:
+        token = sanitize_merge_reject_reason(item)
+        if token:
+            counts[token] += 1
+
+    if not counts:
+        return ""
+
+    ranked = sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:max_distinct]
+    return "|".join(f"{label}:{count}" for label, count in ranked)
+
+
 def deduplicate_tables(tables: Sequence[ExtractedTable]) -> List[ExtractedTable]:
     best_by_signature: Dict[Tuple[int, int, Tuple[Tuple[str, ...], ...]], ExtractedTable] = {}
     for table in tables:
@@ -844,6 +888,9 @@ def write_excel(output_path: Path, tables: Sequence[ExtractedTable]) -> None:
                 else 0.0
             )
             merge_methods = sorted({str(m["method"]) for m in merged_regions}) if merged_regions else []
+            raw_merge_reject_reasons = (
+                table.layout_meta.get("merge_reject_reasons", []) if isinstance(table.layout_meta, dict) else []
+            )
             summary_rows.append(
                 {
                     "sheet_name": sheet_name,
@@ -856,6 +903,7 @@ def write_excel(output_path: Path, tables: Sequence[ExtractedTable]) -> None:
                     "merge_count": len(merged_regions),
                     "merge_confidence_avg": merge_conf_avg,
                     "merge_method": ",".join(merge_methods),
+                    "merge_reject_top_reasons": format_merge_reject_top_reasons(raw_merge_reject_reasons),
                 }
             )
 

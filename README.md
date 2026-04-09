@@ -146,6 +146,12 @@ The generated Excel workbook contains:
 - `Table_001`, `Table_002`, ... — one worksheet per extracted table
 - `_summary` — page number, extraction engine, score/quality indicators, and table shape metadata
 
+### Stable merge reject reasons in `_summary`
+
+- `_summary.merge_reject_top_reasons` now stores sanitized machine-friendly tokens only.
+- Tokens are stripped of control/newline characters, normalized to `[a-z0-9_]`, capped to 40 chars, and limited to top 5 distinct reasons.
+- Ordering is deterministic: count descending, then label ascending.
+
 ---
 
 ## Practical Notes
