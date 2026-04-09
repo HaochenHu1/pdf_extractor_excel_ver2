@@ -6,7 +6,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import fitz  #PyMuPDF
@@ -18,6 +18,7 @@ class ExtractedTable:
     engine: str
     score: float
     title: Optional[str] = None
+    layout_meta: Optional[Dict[str, Any]] = None
 
 #Command line parameters
 #`input_pdf` for pdf path
@@ -260,6 +261,263 @@ def dataframe_signature(df: pd.DataFrame) -> Tuple[int, int, Tuple[Tuple[str, ..
     return df.shape[0], df.shape[1], tuple(rows)
 
 
+def _to_bbox(raw_bbox: object) -> Optional[Tuple[float, float, float, float]]:
+    if raw_bbox is None:
+        return None
+    if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) >= 4:
+        vals = raw_bbox[:4]
+    else:
+        return None
+    try:
+        x0, y0, x1, y1 = (float(vals[0]), float(vals[1]), float(vals[2]), float(vals[3]))
+    except (TypeError, ValueError):
+        return None
+    left, right = sorted((x0, x1))
+    top, bottom = sorted((y0, y1))
+    return left, top, right, bottom
+
+
+def _finalize_layout_meta(
+    raw_cells: Sequence[Dict[str, object]],
+    row_count: int,
+    col_count: int,
+    source_engine: str,
+) -> Dict[str, object]:
+    table_bbox: Optional[Tuple[float, float, float, float]] = None
+    bboxes = [c["bbox"] for c in raw_cells if c.get("bbox") is not None]
+    if bboxes:
+        xs0 = [float(b[0]) for b in bboxes]
+        ys0 = [float(b[1]) for b in bboxes]
+        xs1 = [float(b[2]) for b in bboxes]
+        ys1 = [float(b[3]) for b in bboxes]
+        table_bbox = (min(xs0), min(ys0), max(xs1), max(ys1))
+
+    table_w = (table_bbox[2] - table_bbox[0]) if table_bbox else 0.0
+    table_h = (table_bbox[3] - table_bbox[1]) if table_bbox else 0.0
+
+    canonical_cells: List[Dict[str, object]] = []
+    for cell in raw_cells:
+        row_idx = int(cell["row_idx"])
+        col_idx = int(cell["col_idx"])
+        if row_idx < 0 or col_idx < 0 or row_idx >= row_count or col_idx >= col_count:
+            continue
+
+        bbox = cell.get("bbox")
+        rel_bbox = None
+        if table_bbox is not None and bbox is not None and table_w > 0 and table_h > 0:
+            rel_bbox = (
+                (float(bbox[0]) - table_bbox[0]) / table_w,
+                (float(bbox[1]) - table_bbox[1]) / table_h,
+                (float(bbox[2]) - table_bbox[0]) / table_w,
+                (float(bbox[3]) - table_bbox[1]) / table_h,
+            )
+
+        canonical_cells.append(
+            {
+                "row_idx": row_idx,
+                "col_idx": col_idx,
+                "text": normalize_cell(cell.get("text", "")),
+                "bbox": bbox,
+                "bbox_rel": rel_bbox,
+            }
+        )
+
+    return {
+        "source_engine": source_engine,
+        "table_bbox": table_bbox,
+        "cells": canonical_cells,
+        "canonical_grid": {"rows": row_count, "cols": col_count},
+    }
+
+
+def _default_layout_meta(df: pd.DataFrame, source_engine: str) -> Dict[str, object]:
+    raw_cells: List[Dict[str, object]] = []
+    for row_idx in range(df.shape[0]):
+        for col_idx in range(df.shape[1]):
+            raw_cells.append(
+                {
+                    "row_idx": row_idx,
+                    "col_idx": col_idx,
+                    "text": normalize_cell(df.iat[row_idx, col_idx]),
+                    "bbox": None,
+                }
+            )
+    return _finalize_layout_meta(raw_cells, df.shape[0], df.shape[1], source_engine)
+
+
+def _collect_camelot_layout_meta(table: object, df: pd.DataFrame, source_engine: str) -> Dict[str, object]:
+    raw_cells: List[Dict[str, object]] = []
+    table_cells = getattr(table, "cells", None)
+    if table_cells:
+        for row_idx, row in enumerate(table_cells):
+            for col_idx, cell in enumerate(row):
+                bbox = _to_bbox(
+                    (
+                        getattr(cell, "x1", None),
+                        getattr(cell, "y1", None),
+                        getattr(cell, "x2", None),
+                        getattr(cell, "y2", None),
+                    )
+                )
+                text = ""
+                if row_idx < df.shape[0] and col_idx < df.shape[1]:
+                    text = normalize_cell(df.iat[row_idx, col_idx])
+                raw_cells.append(
+                    {"row_idx": row_idx, "col_idx": col_idx, "text": text, "bbox": bbox}
+                )
+    if not raw_cells:
+        return _default_layout_meta(df, source_engine)
+    return _finalize_layout_meta(raw_cells, df.shape[0], df.shape[1], source_engine)
+
+
+def _collect_pdfplumber_layout_meta(table_obj: object, df: pd.DataFrame, source_engine: str) -> Dict[str, object]:
+    raw_cells: List[Dict[str, object]] = []
+    rows = getattr(table_obj, "rows", None) or []
+    for row_idx, row in enumerate(rows):
+        cells = getattr(row, "cells", None) or []
+        for col_idx, bbox_candidate in enumerate(cells):
+            bbox = _to_bbox(bbox_candidate)
+            text = ""
+            if row_idx < df.shape[0] and col_idx < df.shape[1]:
+                text = normalize_cell(df.iat[row_idx, col_idx])
+            raw_cells.append(
+                {"row_idx": row_idx, "col_idx": col_idx, "text": text, "bbox": bbox}
+            )
+
+    if not raw_cells:
+        return _default_layout_meta(df, source_engine)
+    return _finalize_layout_meta(raw_cells, df.shape[0], df.shape[1], source_engine)
+
+
+def _collect_img2table_layout_meta(table: object, df: pd.DataFrame, source_engine: str) -> Dict[str, object]:
+    raw_cells: List[Dict[str, object]] = []
+
+    content = getattr(table, "content", None)
+    if isinstance(content, dict):
+        for row_idx, row_cells in content.items():
+            if not isinstance(row_cells, dict):
+                continue
+            for col_idx, cell in row_cells.items():
+                bbox = _to_bbox(getattr(cell, "bbox", None))
+                text = normalize_cell(getattr(cell, "value", ""))
+                raw_cells.append(
+                    {
+                        "row_idx": int(row_idx),
+                        "col_idx": int(col_idx),
+                        "text": text,
+                        "bbox": bbox,
+                    }
+                )
+
+    if not raw_cells:
+        return _default_layout_meta(df, source_engine)
+    return _finalize_layout_meta(raw_cells, df.shape[0], df.shape[1], source_engine)
+
+
+def infer_merged_regions(extracted_table: ExtractedTable) -> List[Dict[str, object]]:
+    df = extracted_table.df
+    layout_meta = extracted_table.layout_meta or {}
+    cells = layout_meta.get("cells", []) if isinstance(layout_meta, dict) else []
+    cell_lookup: Dict[Tuple[int, int], Dict[str, object]] = {}
+    for cell in cells:
+        key = (int(cell.get("row_idx", -1)), int(cell.get("col_idx", -1)))
+        cell_lookup[key] = cell
+
+    def bbox_alignment_score(anchor: Optional[Tuple[float, float, float, float]], candidate: Optional[Tuple[float, float, float, float]], axis: str) -> float:
+        if anchor is None or candidate is None:
+            return 0.5
+        if axis == "horizontal":
+            top = max(float(anchor[1]), float(candidate[1]))
+            bottom = min(float(anchor[3]), float(candidate[3]))
+            union_top = min(float(anchor[1]), float(candidate[1]))
+            union_bottom = max(float(anchor[3]), float(candidate[3]))
+            overlap = max(0.0, bottom - top)
+            union = max(1e-6, union_bottom - union_top)
+            return min(1.0, overlap / union)
+        left = max(float(anchor[0]), float(candidate[0]))
+        right = min(float(anchor[2]), float(candidate[2]))
+        union_left = min(float(anchor[0]), float(candidate[0]))
+        union_right = max(float(anchor[2]), float(candidate[2]))
+        overlap = max(0.0, right - left)
+        union = max(1e-6, union_right - union_left)
+        return min(1.0, overlap / union)
+
+    merged: List[Dict[str, object]] = []
+    occupied: set[Tuple[int, int, int, int]] = set()
+    for row_idx in range(df.shape[0]):
+        for col_idx in range(df.shape[1]):
+            anchor_text = normalize_cell(df.iat[row_idx, col_idx])
+            if anchor_text == "":
+                continue
+
+            anchor_bbox = None
+            if (row_idx, col_idx) in cell_lookup:
+                anchor_bbox = cell_lookup[(row_idx, col_idx)].get("bbox")
+
+            horiz_end = col_idx
+            horiz_geom_scores: List[float] = []
+            for next_col in range(col_idx + 1, df.shape[1]):
+                next_text = normalize_cell(df.iat[row_idx, next_col])
+                if next_text != "":
+                    break
+                next_bbox = cell_lookup.get((row_idx, next_col), {}).get("bbox")
+                horiz_geom_scores.append(bbox_alignment_score(anchor_bbox, next_bbox, "horizontal"))
+                horiz_end = next_col
+            horiz_span = horiz_end - col_idx + 1
+
+            vert_end = row_idx
+            vert_geom_scores: List[float] = []
+            for next_row in range(row_idx + 1, df.shape[0]):
+                next_text = normalize_cell(df.iat[next_row, col_idx])
+                if next_text != "":
+                    break
+                next_bbox = cell_lookup.get((next_row, col_idx), {}).get("bbox")
+                vert_geom_scores.append(bbox_alignment_score(anchor_bbox, next_bbox, "vertical"))
+                vert_end = next_row
+            vert_span = vert_end - row_idx + 1
+
+            if horiz_span <= 1 and vert_span <= 1:
+                continue
+
+            use_horizontal = horiz_span >= vert_span
+            if use_horizontal:
+                key = (row_idx, col_idx, row_idx, horiz_end)
+                if key in occupied:
+                    continue
+                mean_geom = sum(horiz_geom_scores) / len(horiz_geom_scores) if horiz_geom_scores else 0.5
+                confidence = round(min(1.0, 0.45 + 0.55 * mean_geom), 4)
+                occupied.add(key)
+                merged.append(
+                    {
+                        "start_row": row_idx,
+                        "end_row": row_idx,
+                        "start_col": col_idx,
+                        "end_col": horiz_end,
+                        "confidence": confidence,
+                        "method": "geometry+empty_neighbor" if horiz_geom_scores else "empty_neighbor",
+                    }
+                )
+            else:
+                key = (row_idx, col_idx, vert_end, col_idx)
+                if key in occupied:
+                    continue
+                mean_geom = sum(vert_geom_scores) / len(vert_geom_scores) if vert_geom_scores else 0.5
+                confidence = round(min(1.0, 0.45 + 0.55 * mean_geom), 4)
+                occupied.add(key)
+                merged.append(
+                    {
+                        "start_row": row_idx,
+                        "end_row": vert_end,
+                        "start_col": col_idx,
+                        "end_col": col_idx,
+                        "confidence": confidence,
+                        "method": "geometry+empty_neighbor" if vert_geom_scores else "empty_neighbor",
+                    }
+                )
+
+    return merged
+
+
 def deduplicate_tables(tables: Sequence[ExtractedTable]) -> List[ExtractedTable]:
     best_by_signature: Dict[Tuple[int, int, Tuple[Tuple[str, ...], ...]], ExtractedTable] = {}
     for table in tables:
@@ -354,6 +612,7 @@ def extract_with_camelot(
                         engine=f"camelot_{flavor}",
                         score=score,
                         title=f"Camelot {flavor} table {idx + 1}",
+                        layout_meta=_collect_camelot_layout_meta(table, df, f"camelot_{flavor}"),
                     )
                 )
             except Exception as exc:
@@ -399,15 +658,16 @@ def extract_with_pdfplumber(
             page = pdf.pages[page_num - 1]
             for setting_idx, table_settings in enumerate(PDFPLUMBER_SETTINGS, start=1):
                 try:
-                    raw_tables = page.extract_tables(table_settings=table_settings)
+                    raw_tables = page.find_tables(table_settings=table_settings)
                 except Exception as exc:
                     log(
                         f"pdfplumber failed on page {page_num} with setting {setting_idx}: {exc}",
                         verbose,
                     )
                     continue
-                for idx, raw_table in enumerate(raw_tables):
+                for idx, table_obj in enumerate(raw_tables):
                     try:
+                        raw_table = table_obj.extract()
                         df = clean_dataframe(pd.DataFrame(raw_table))
                         if not looks_like_table(df, min_rows, min_cols, min_filled_ratio):
                             continue
@@ -419,6 +679,9 @@ def extract_with_pdfplumber(
                                 engine=f"pdfplumber_s{setting_idx}",
                                 score=score,
                                 title=f"pdfplumber setting {setting_idx} table {idx + 1}",
+                                layout_meta=_collect_pdfplumber_layout_meta(
+                                    table_obj, df, f"pdfplumber_s{setting_idx}"
+                                ),
                             )
                         )
                     except Exception as exc:
@@ -505,6 +768,7 @@ def extract_with_img2table(
                         engine="img2table",
                         score=score,
                         title=f"img2table table {idx + 1}",
+                        layout_meta=_collect_img2table_layout_meta(table, df, "img2table"),
                     )
                 )
             except Exception as exc:
@@ -573,6 +837,13 @@ def write_excel(output_path: Path, tables: Sequence[ExtractedTable]) -> None:
         for idx, table in enumerate(tables, start=1):
             sheet_name = f"Table_{idx:03d}"
             table.df.to_excel(writer, index=False, sheet_name=sheet_name)
+            merged_regions = infer_merged_regions(table)
+            merge_conf_avg = (
+                round(sum(float(m["confidence"]) for m in merged_regions) / len(merged_regions), 4)
+                if merged_regions
+                else 0.0
+            )
+            merge_methods = sorted({str(m["method"]) for m in merged_regions}) if merged_regions else []
             summary_rows.append(
                 {
                     "sheet_name": sheet_name,
@@ -582,6 +853,9 @@ def write_excel(output_path: Path, tables: Sequence[ExtractedTable]) -> None:
                     "rows": table.df.shape[0],
                     "cols": table.df.shape[1],
                     "title": table.title or "",
+                    "merge_count": len(merged_regions),
+                    "merge_confidence_avg": merge_conf_avg,
+                    "merge_method": ",".join(merge_methods),
                 }
             )
 
@@ -589,6 +863,22 @@ def write_excel(output_path: Path, tables: Sequence[ExtractedTable]) -> None:
         summary_df.to_excel(writer, index=False, sheet_name="_summary")
 
         workbook = writer.book
+        for idx, table in enumerate(tables, start=1):
+            sheet = workbook[f"Table_{idx:03d}"]
+            for region in infer_merged_regions(table):
+                start_row = int(region["start_row"]) + 2
+                end_row = int(region["end_row"]) + 2
+                start_col = int(region["start_col"]) + 1
+                end_col = int(region["end_col"]) + 1
+                if start_row == end_row and start_col == end_col:
+                    continue
+                sheet.merge_cells(
+                    start_row=start_row,
+                    start_column=start_col,
+                    end_row=end_row,
+                    end_column=end_col,
+                )
+
         for sheet in workbook.worksheets:
             for column_cells in sheet.columns:
                 values = [str(cell.value) if cell.value is not None else "" for cell in column_cells]
