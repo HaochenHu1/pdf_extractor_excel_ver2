@@ -169,3 +169,36 @@ python pdf_table_extractor.py financial_report.pdf -o financial_tables.xlsx --oc
 ## Known Limitation
 
 - Accuracy on heavily degraded Chinese scanned PDFs can still vary depending on image quality and OCR configuration.
+
+---
+
+## Phase 3: Golden Merge Expectations (JSON)
+
+For merge-quality regression checks, create JSON/JSONL records with these fields:
+
+```json
+{
+  "doc_id": "training1.pdf",
+  "page": 1,
+  "table_id": "Table_001",
+  "predicted_merges": [
+    {"start_row": 0, "end_row": 0, "start_col": 0, "end_col": 2}
+  ],
+  "expected_merges": [
+    {"start_row": 0, "end_row": 0, "start_col": 0, "end_col": 2}
+  ]
+}
+```
+
+Minimal schema notes:
+
+- `predicted_merges` and `expected_merges` are arrays of merge-region objects.
+- Each merge region must include integer fields:
+  - `start_row`, `end_row`, `start_col`, `end_col`
+- Matching is **exact region equality** on those 4 coordinates.
+
+Evaluate with:
+
+```bash
+python training/eval_merge_quality.py <path_to_json_or_jsonl_or_directory>
+```
