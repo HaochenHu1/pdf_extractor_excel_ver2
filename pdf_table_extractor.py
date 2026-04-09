@@ -4,9 +4,10 @@ import argparse
 import re
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import fitz  #PyMuPDF
@@ -18,6 +19,7 @@ class ExtractedTable:
     engine: str
     score: float
     title: Optional[str] = None
+    layout_meta: Optional[Dict[str, Any]] = None
 
 #Command line parameters
 #`input_pdf` for pdf path
@@ -118,6 +120,11 @@ def parse_args() -> argparse.Namespace:
         "--verbose",
         action="store_true",
         help="Print extraction progress",
+    )
+    parser.add_argument(
+        "--merge-debug",
+        action="store_true",
+        help="Print top rejected merge candidates for diagnostics",
     )
     return parser.parse_args()
 
@@ -260,6 +267,452 @@ def dataframe_signature(df: pd.DataFrame) -> Tuple[int, int, Tuple[Tuple[str, ..
     return df.shape[0], df.shape[1], tuple(rows)
 
 
+def _to_bbox(raw_bbox: object) -> Optional[Tuple[float, float, float, float]]:
+    if raw_bbox is None:
+        return None
+    if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) >= 4:
+        vals = raw_bbox[:4]
+    else:
+        return None
+    try:
+        x0, y0, x1, y1 = (float(vals[0]), float(vals[1]), float(vals[2]), float(vals[3]))
+    except (TypeError, ValueError):
+        return None
+    left, right = sorted((x0, x1))
+    top, bottom = sorted((y0, y1))
+    return left, top, right, bottom
+
+
+def _finalize_layout_meta(
+    raw_cells: Sequence[Dict[str, object]],
+    row_count: int,
+    col_count: int,
+    source_engine: str,
+) -> Dict[str, object]:
+    table_bbox: Optional[Tuple[float, float, float, float]] = None
+    bboxes = [c["bbox"] for c in raw_cells if c.get("bbox") is not None]
+    if bboxes:
+        xs0 = [float(b[0]) for b in bboxes]
+        ys0 = [float(b[1]) for b in bboxes]
+        xs1 = [float(b[2]) for b in bboxes]
+        ys1 = [float(b[3]) for b in bboxes]
+        table_bbox = (min(xs0), min(ys0), max(xs1), max(ys1))
+
+    table_w = (table_bbox[2] - table_bbox[0]) if table_bbox else 0.0
+    table_h = (table_bbox[3] - table_bbox[1]) if table_bbox else 0.0
+
+    canonical_cells: List[Dict[str, object]] = []
+    for cell in raw_cells:
+        row_idx = int(cell["row_idx"])
+        col_idx = int(cell["col_idx"])
+        if row_idx < 0 or col_idx < 0 or row_idx >= row_count or col_idx >= col_count:
+            continue
+
+        bbox = cell.get("bbox")
+        rel_bbox = None
+        if table_bbox is not None and bbox is not None and table_w > 0 and table_h > 0:
+            rel_bbox = (
+                (float(bbox[0]) - table_bbox[0]) / table_w,
+                (float(bbox[1]) - table_bbox[1]) / table_h,
+                (float(bbox[2]) - table_bbox[0]) / table_w,
+                (float(bbox[3]) - table_bbox[1]) / table_h,
+            )
+
+        canonical_cells.append(
+            {
+                "row_idx": row_idx,
+                "col_idx": col_idx,
+                "text": normalize_cell(cell.get("text", "")),
+                "bbox": bbox,
+                "bbox_rel": rel_bbox,
+            }
+        )
+
+    return {
+        "source_engine": source_engine,
+        "table_bbox": table_bbox,
+        "cells": canonical_cells,
+        "canonical_grid": {"rows": row_count, "cols": col_count},
+    }
+
+
+def _default_layout_meta(df: pd.DataFrame, source_engine: str) -> Dict[str, object]:
+    raw_cells: List[Dict[str, object]] = []
+    for row_idx in range(df.shape[0]):
+        for col_idx in range(df.shape[1]):
+            raw_cells.append(
+                {
+                    "row_idx": row_idx,
+                    "col_idx": col_idx,
+                    "text": normalize_cell(df.iat[row_idx, col_idx]),
+                    "bbox": None,
+                }
+            )
+    return _finalize_layout_meta(raw_cells, df.shape[0], df.shape[1], source_engine)
+
+
+def _collect_camelot_layout_meta(table: object, df: pd.DataFrame, source_engine: str) -> Dict[str, object]:
+    raw_cells: List[Dict[str, object]] = []
+    table_cells = getattr(table, "cells", None)
+    if table_cells:
+        for row_idx, row in enumerate(table_cells):
+            for col_idx, cell in enumerate(row):
+                bbox = _to_bbox(
+                    (
+                        getattr(cell, "x1", None),
+                        getattr(cell, "y1", None),
+                        getattr(cell, "x2", None),
+                        getattr(cell, "y2", None),
+                    )
+                )
+                text = ""
+                if row_idx < df.shape[0] and col_idx < df.shape[1]:
+                    text = normalize_cell(df.iat[row_idx, col_idx])
+                raw_cells.append(
+                    {"row_idx": row_idx, "col_idx": col_idx, "text": text, "bbox": bbox}
+                )
+    if not raw_cells:
+        return _default_layout_meta(df, source_engine)
+    return _finalize_layout_meta(raw_cells, df.shape[0], df.shape[1], source_engine)
+
+
+def _collect_pdfplumber_layout_meta(table_obj: object, df: pd.DataFrame, source_engine: str) -> Dict[str, object]:
+    raw_cells: List[Dict[str, object]] = []
+    rows = getattr(table_obj, "rows", None) or []
+    for row_idx, row in enumerate(rows):
+        cells = getattr(row, "cells", None) or []
+        for col_idx, bbox_candidate in enumerate(cells):
+            bbox = _to_bbox(bbox_candidate)
+            text = ""
+            if row_idx < df.shape[0] and col_idx < df.shape[1]:
+                text = normalize_cell(df.iat[row_idx, col_idx])
+            raw_cells.append(
+                {"row_idx": row_idx, "col_idx": col_idx, "text": text, "bbox": bbox}
+            )
+
+    if not raw_cells:
+        return _default_layout_meta(df, source_engine)
+    return _finalize_layout_meta(raw_cells, df.shape[0], df.shape[1], source_engine)
+
+
+def _collect_img2table_layout_meta(table: object, df: pd.DataFrame, source_engine: str) -> Dict[str, object]:
+    raw_cells: List[Dict[str, object]] = []
+
+    content = getattr(table, "content", None)
+    if isinstance(content, dict):
+        for row_idx, row_cells in content.items():
+            if not isinstance(row_cells, dict):
+                continue
+            for col_idx, cell in row_cells.items():
+                bbox = _to_bbox(getattr(cell, "bbox", None))
+                text = normalize_cell(getattr(cell, "value", ""))
+                raw_cells.append(
+                    {
+                        "row_idx": int(row_idx),
+                        "col_idx": int(col_idx),
+                        "text": text,
+                        "bbox": bbox,
+                    }
+                )
+
+    if not raw_cells:
+        return _default_layout_meta(df, source_engine)
+    return _finalize_layout_meta(raw_cells, df.shape[0], df.shape[1], source_engine)
+
+
+MERGE_PROFILES: Dict[str, Dict[str, float]] = {
+    # Tunable thresholds kept in one place for deterministic local calibration.
+    "text": {
+        "edge_tol": 2.0,
+        "boundary_consistency_min": 0.55,
+        "header_accept_threshold": 0.66,
+        "body_accept_threshold": 0.7,
+        "w_geom": 0.4,
+        "w_empty": 0.25,
+        "w_boundary": 0.25,
+        "w_penalty": 0.3,
+    },
+    "scanned": {
+        "edge_tol": 4.0,
+        "boundary_consistency_min": 0.45,
+        "header_accept_threshold": 0.58,
+        "body_accept_threshold": 0.62,
+        "w_geom": 0.34,
+        "w_empty": 0.26,
+        "w_boundary": 0.2,
+        "w_penalty": 0.22,
+    },
+}
+
+
+def _merge_profile_for_engine(engine: str) -> Dict[str, float]:
+    if engine.startswith("img2table"):
+        return MERGE_PROFILES["scanned"]
+    return MERGE_PROFILES["text"]
+
+
+def _build_cell_lookup(layout_meta: Optional[Dict[str, Any]]) -> Dict[Tuple[int, int], Dict[str, object]]:
+    cells = layout_meta.get("cells", []) if isinstance(layout_meta, dict) else []
+    lookup: Dict[Tuple[int, int], Dict[str, object]] = {}
+    for cell in cells:
+        key = (int(cell.get("row_idx", -1)), int(cell.get("col_idx", -1)))
+        lookup[key] = cell
+    return lookup
+
+
+def _bbox_alignment_score(
+    anchor: Optional[Tuple[float, float, float, float]],
+    candidate: Optional[Tuple[float, float, float, float]],
+    axis: str,
+) -> float:
+    if anchor is None or candidate is None:
+        return 0.5
+    if axis == "horizontal":
+        top = max(float(anchor[1]), float(candidate[1]))
+        bottom = min(float(anchor[3]), float(candidate[3]))
+        union_top = min(float(anchor[1]), float(candidate[1]))
+        union_bottom = max(float(anchor[3]), float(candidate[3]))
+        overlap = max(0.0, bottom - top)
+        union = max(1e-6, union_bottom - union_top)
+        return min(1.0, overlap / union)
+    left = max(float(anchor[0]), float(candidate[0]))
+    right = min(float(anchor[2]), float(candidate[2]))
+    union_left = min(float(anchor[0]), float(candidate[0]))
+    union_right = max(float(anchor[2]), float(candidate[2]))
+    overlap = max(0.0, right - left)
+    union = max(1e-6, union_right - union_left)
+    return min(1.0, overlap / union)
+
+
+def _candidate_key(candidate: Dict[str, int]) -> Tuple[int, int, int, int]:
+    return (
+        int(candidate["start_row"]),
+        int(candidate["start_col"]),
+        int(candidate["end_row"]),
+        int(candidate["end_col"]),
+    )
+
+
+def _ranges_overlap(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> bool:
+    a_r0, a_c0, a_r1, a_c1 = a
+    b_r0, b_c0, b_r1, b_c1 = b
+    row_overlap = not (a_r1 < b_r0 or b_r1 < a_r0)
+    col_overlap = not (a_c1 < b_c0 or b_c1 < a_c0)
+    return row_overlap and col_overlap
+
+
+def _evaluate_merge_candidate(
+    extracted_table: ExtractedTable,
+    candidate: Dict[str, int],
+    profile: Dict[str, float],
+    is_header: bool,
+) -> Dict[str, object]:
+    df = extracted_table.df
+    cell_lookup = _build_cell_lookup(extracted_table.layout_meta)
+    start_row, start_col, end_row, end_col = _candidate_key(candidate)
+    anchor_bbox = cell_lookup.get((start_row, start_col), {}).get("bbox")
+    axis = "horizontal" if end_col > start_col else "vertical"
+
+    coords = [
+        (r, c)
+        for r in range(start_row, end_row + 1)
+        for c in range(start_col, end_col + 1)
+        if not (r == start_row and c == start_col)
+    ]
+    if not coords:
+        return {"accepted": False, "reason": "single_cell"}
+
+    geom_scores: List[float] = []
+    empty_count = 0
+    non_empty_count = 0
+    for r, c in coords:
+        value = normalize_cell(df.iat[r, c])
+        if value == "":
+            empty_count += 1
+        else:
+            non_empty_count += 1
+        bbox = cell_lookup.get((r, c), {}).get("bbox")
+        geom_scores.append(_bbox_alignment_score(anchor_bbox, bbox, axis))
+
+    geometry_score = sum(geom_scores) / len(geom_scores) if geom_scores else 0.5
+    empty_score = empty_count / max(1, len(coords))
+    text_conflict_penalty = non_empty_count / max(1, len(coords))
+    reason_tags: List[str] = []
+    if empty_score >= 0.8:
+        reason_tags.append("adjacent_empty")
+
+    boundary_consistency = 1.0
+    strong_boundary_count = 0
+    if axis == "horizontal":
+        for col in range(start_col, end_col):
+            has_left_text = any(normalize_cell(df.iat[row, col]) != "" for row in range(start_row, end_row + 1))
+            has_right_text = any(normalize_cell(df.iat[row, col + 1]) != "" for row in range(start_row, end_row + 1))
+            if has_left_text and has_right_text:
+                strong_boundary_count += 1
+    else:
+        for row in range(start_row, end_row):
+            has_top_text = any(normalize_cell(df.iat[row, col]) != "" for col in range(start_col, end_col + 1))
+            has_bottom_text = any(normalize_cell(df.iat[row + 1, col]) != "" for col in range(start_col, end_col + 1))
+            if has_top_text and has_bottom_text:
+                strong_boundary_count += 1
+
+    if strong_boundary_count > 0:
+        boundary_consistency = max(0.0, 1.0 - (strong_boundary_count / max(1, len(coords))))
+        reason_tags.append("cross_internal_boundary")
+
+    if text_conflict_penalty > 0:
+        reason_tags.append("text_conflict")
+
+    total_score = (
+        profile["w_geom"] * geometry_score
+        + profile["w_empty"] * empty_score
+        + profile["w_boundary"] * boundary_consistency
+        - profile["w_penalty"] * text_conflict_penalty
+    )
+    threshold = profile["header_accept_threshold"] if is_header else profile["body_accept_threshold"]
+    accepted = total_score >= threshold and boundary_consistency >= profile["boundary_consistency_min"]
+
+    return {
+        "accepted": accepted,
+        "reason_tags": reason_tags,
+        "geometry_score": round(geometry_score, 4),
+        "empty_score": round(empty_score, 4),
+        "boundary_score": round(boundary_consistency, 4),
+        "text_penalty": round(text_conflict_penalty, 4),
+        "score": round(total_score, 4),
+        "threshold": threshold,
+        "method": "weighted_geometry_empty_boundary",
+    }
+
+
+def detect_header_spans(extracted_table: ExtractedTable) -> Dict[str, List[Dict[str, object]]]:
+    df = extracted_table.df
+    profile = _merge_profile_for_engine(extracted_table.engine)
+    max_header_rows = min(3, df.shape[0])
+    accepted: List[Dict[str, object]] = []
+    rejected: List[Dict[str, object]] = []
+    seen: set[Tuple[int, int, int, int]] = set()
+
+    for row_idx in range(max_header_rows):
+        for col_idx in range(df.shape[1]):
+            anchor_text = normalize_cell(df.iat[row_idx, col_idx])
+            if anchor_text == "":
+                continue
+            span_end = col_idx
+            for next_col in range(col_idx + 1, df.shape[1]):
+                if normalize_cell(df.iat[row_idx, next_col]) != "":
+                    break
+                span_end = next_col
+            if span_end <= col_idx:
+                continue
+
+            candidate = {
+                "start_row": row_idx,
+                "end_row": row_idx,
+                "start_col": col_idx,
+                "end_col": span_end,
+            }
+            key = _candidate_key(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            eval_result = _evaluate_merge_candidate(extracted_table, candidate, profile, is_header=True)
+            next_row_density = 0.0
+            if row_idx + 1 < df.shape[0]:
+                non_empty_next = 0
+                width = span_end - col_idx + 1
+                for c in range(col_idx, span_end + 1):
+                    if normalize_cell(df.iat[row_idx + 1, c]) != "":
+                        non_empty_next += 1
+                next_row_density = non_empty_next / max(1, width)
+                eval_result["score"] = round(float(eval_result["score"]) + 0.12 * next_row_density, 4)
+                if next_row_density >= 0.5:
+                    eval_result.setdefault("reason_tags", []).append("dense_subheader_next_row")
+
+            if float(eval_result["score"]) >= profile["header_accept_threshold"] and bool(eval_result["accepted"]):
+                accepted.append(
+                    {
+                        **candidate,
+                        "confidence": float(eval_result["score"]),
+                        "method": str(eval_result["method"]),
+                        "reason_tags": eval_result.get("reason_tags", []),
+                    }
+                )
+            else:
+                rejected.append({**candidate, **eval_result, "candidate_type": "header"})
+
+    return {"accepted": accepted, "rejected": rejected}
+
+
+def infer_merged_regions(extracted_table: ExtractedTable) -> Dict[str, List[Dict[str, object]]]:
+    df = extracted_table.df
+    profile = _merge_profile_for_engine(extracted_table.engine)
+    header_result = detect_header_spans(extracted_table)
+    header_spans = header_result["accepted"]
+    rejected: List[Dict[str, object]] = list(header_result["rejected"])
+
+    body_candidates: List[Dict[str, int]] = []
+    for row_idx in range(df.shape[0]):
+        for col_idx in range(df.shape[1]):
+            anchor_text = normalize_cell(df.iat[row_idx, col_idx])
+            if anchor_text == "":
+                continue
+
+            horiz_end = col_idx
+            for next_col in range(col_idx + 1, df.shape[1]):
+                if normalize_cell(df.iat[row_idx, next_col]) != "":
+                    break
+                horiz_end = next_col
+            if horiz_end > col_idx:
+                body_candidates.append(
+                    {
+                        "start_row": row_idx,
+                        "end_row": row_idx,
+                        "start_col": col_idx,
+                        "end_col": horiz_end,
+                    }
+                )
+
+            vert_end = row_idx
+            for next_row in range(row_idx + 1, df.shape[0]):
+                if normalize_cell(df.iat[next_row, col_idx]) != "":
+                    break
+                vert_end = next_row
+            if vert_end > row_idx:
+                body_candidates.append(
+                    {
+                        "start_row": row_idx,
+                        "end_row": vert_end,
+                        "start_col": col_idx,
+                        "end_col": col_idx,
+                    }
+                )
+
+    body_spans: List[Dict[str, object]] = []
+    for candidate in body_candidates:
+        evaluation = _evaluate_merge_candidate(extracted_table, candidate, profile, is_header=False)
+        if evaluation["accepted"]:
+            body_spans.append(
+                {
+                    **candidate,
+                    "confidence": float(evaluation["score"]),
+                    "method": str(evaluation["method"]),
+                    "reason_tags": evaluation.get("reason_tags", []),
+                }
+            )
+        else:
+            rejected.append({**candidate, **evaluation, "candidate_type": "body"})
+
+    accepted_all = header_spans + body_spans
+    return {
+        "header_spans": header_spans,
+        "body_spans": body_spans,
+        "accepted": accepted_all,
+        "rejected": rejected,
+    }
+
+
 def deduplicate_tables(tables: Sequence[ExtractedTable]) -> List[ExtractedTable]:
     best_by_signature: Dict[Tuple[int, int, Tuple[Tuple[str, ...], ...]], ExtractedTable] = {}
     for table in tables:
@@ -354,6 +807,7 @@ def extract_with_camelot(
                         engine=f"camelot_{flavor}",
                         score=score,
                         title=f"Camelot {flavor} table {idx + 1}",
+                        layout_meta=_collect_camelot_layout_meta(table, df, f"camelot_{flavor}"),
                     )
                 )
             except Exception as exc:
@@ -399,15 +853,16 @@ def extract_with_pdfplumber(
             page = pdf.pages[page_num - 1]
             for setting_idx, table_settings in enumerate(PDFPLUMBER_SETTINGS, start=1):
                 try:
-                    raw_tables = page.extract_tables(table_settings=table_settings)
+                    raw_tables = page.find_tables(table_settings=table_settings)
                 except Exception as exc:
                     log(
                         f"pdfplumber failed on page {page_num} with setting {setting_idx}: {exc}",
                         verbose,
                     )
                     continue
-                for idx, raw_table in enumerate(raw_tables):
+                for idx, table_obj in enumerate(raw_tables):
                     try:
+                        raw_table = table_obj.extract()
                         df = clean_dataframe(pd.DataFrame(raw_table))
                         if not looks_like_table(df, min_rows, min_cols, min_filled_ratio):
                             continue
@@ -419,6 +874,9 @@ def extract_with_pdfplumber(
                                 engine=f"pdfplumber_s{setting_idx}",
                                 score=score,
                                 title=f"pdfplumber setting {setting_idx} table {idx + 1}",
+                                layout_meta=_collect_pdfplumber_layout_meta(
+                                    table_obj, df, f"pdfplumber_s{setting_idx}"
+                                ),
                             )
                         )
                     except Exception as exc:
@@ -505,6 +963,7 @@ def extract_with_img2table(
                         engine="img2table",
                         score=score,
                         title=f"img2table table {idx + 1}",
+                        layout_meta=_collect_img2table_layout_meta(table, df, "img2table"),
                     )
                 )
             except Exception as exc:
@@ -565,14 +1024,30 @@ def get_available_tesseract_languages() -> set[str]:
 #metadata for each result, such as page number, table index, score, shape, and title.
 #After all sheets are created, the function uses openpyxl to do some light formatting,
 #including adjusting column widths and freezing the top row so the file is easier to read.
-def write_excel(output_path: Path, tables: Sequence[ExtractedTable]) -> None:
+def write_excel(output_path: Path, tables: Sequence[ExtractedTable], merge_debug: bool = False) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        merge_plans: Dict[int, Dict[str, List[Dict[str, object]]]] = {}
         summary_rows = []
         for idx, table in enumerate(tables, start=1):
             sheet_name = f"Table_{idx:03d}"
             table.df.to_excel(writer, index=False, sheet_name=sheet_name)
+            merge_plan = infer_merged_regions(table)
+            merge_plans[idx] = merge_plan
+            merged_regions = merge_plan["accepted"]
+            rejected_regions = merge_plan["rejected"]
+            merge_conf_avg = (
+                round(sum(float(m["confidence"]) for m in merged_regions) / len(merged_regions), 4)
+                if merged_regions
+                else 0.0
+            )
+            merge_methods = sorted({str(m["method"]) for m in merged_regions}) if merged_regions else []
+            reject_reason_counter: Counter[str] = Counter()
+            for region in rejected_regions:
+                for reason in region.get("reason_tags", [])[:3]:
+                    reject_reason_counter[str(reason)] += 1
+            top_reasons = ",".join(reason for reason, _ in reject_reason_counter.most_common(3))
             summary_rows.append(
                 {
                     "sheet_name": sheet_name,
@@ -582,6 +1057,13 @@ def write_excel(output_path: Path, tables: Sequence[ExtractedTable]) -> None:
                     "rows": table.df.shape[0],
                     "cols": table.df.shape[1],
                     "title": table.title or "",
+                    "merge_count": len(merged_regions),
+                    "merge_confidence_avg": merge_conf_avg,
+                    "merge_method": ",".join(merge_methods),
+                    "header_merge_count": len(merge_plan["header_spans"]),
+                    "body_merge_count": len(merge_plan["body_spans"]),
+                    "merge_reject_count": len(rejected_regions),
+                    "merge_reject_top_reasons": top_reasons,
                 }
             )
 
@@ -589,6 +1071,50 @@ def write_excel(output_path: Path, tables: Sequence[ExtractedTable]) -> None:
         summary_df.to_excel(writer, index=False, sheet_name="_summary")
 
         workbook = writer.book
+        for idx, table in enumerate(tables, start=1):
+            sheet = workbook[f"Table_{idx:03d}"]
+            merge_plan = merge_plans[idx]
+            seen_ranges: List[Tuple[int, int, int, int]] = []
+            ordered_spans = merge_plan["header_spans"] + merge_plan["body_spans"]
+            for region in ordered_spans:
+                candidate_key = (
+                    int(region["start_row"]),
+                    int(region["start_col"]),
+                    int(region["end_row"]),
+                    int(region["end_col"]),
+                )
+                if any(_ranges_overlap(candidate_key, existing) for existing in seen_ranges):
+                    continue
+                start_row = int(region["start_row"]) + 2
+                end_row = int(region["end_row"]) + 2
+                start_col = int(region["start_col"]) + 1
+                end_col = int(region["end_col"]) + 1
+                if start_row == end_row and start_col == end_col:
+                    continue
+                sheet.merge_cells(
+                    start_row=start_row,
+                    start_column=start_col,
+                    end_row=end_row,
+                    end_column=end_col,
+                )
+                seen_ranges.append(candidate_key)
+
+            if merge_debug and merge_plan["rejected"]:
+                top_rejected = sorted(
+                    merge_plan["rejected"],
+                    key=lambda item: float(item.get("score", -1.0)),
+                )[:5]
+                print(f"[merge-debug] {sheet.title}: top rejected candidates")
+                for item in top_rejected:
+                    print(
+                        "  "
+                        f"{item.get('candidate_type')} "
+                        f"r{item.get('start_row')}c{item.get('start_col')}-"
+                        f"r{item.get('end_row')}c{item.get('end_col')}, "
+                        f"score={item.get('score')}<{item.get('threshold')} "
+                        f"reasons={','.join(item.get('reason_tags', []))}"
+                    )
+
         for sheet in workbook.worksheets:
             for column_cells in sheet.columns:
                 values = [str(cell.value) if cell.value is not None else "" for cell in column_cells]
@@ -805,7 +1331,7 @@ def main() -> int:
                 failures += 1
                 continue
             output_path = build_output_path(args, input_pdf, batch_mode)
-            write_excel(output_path, extracted)
+            write_excel(output_path, extracted, merge_debug=args.merge_debug)
             print(f"[OK] {input_pdf.name}: saved {len(extracted)} table(s) to {output_path}")
         except Exception as exc:
             print(f"[FAILED] {input_pdf}: {exc}", file=sys.stderr)
