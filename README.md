@@ -218,3 +218,20 @@ python training/tune_merge_profiles.py --input <path_to_json_or_jsonl_or_directo
 ```
 
 `tune_merge_profiles.py` does **not** modify runtime constants by default. Even with `--apply`, it only writes a suggested profile artifact file.
+
+---
+
+## Phase 3 quality gate (quick check)
+
+Use this reproducible command sequence before sharing results:
+
+```bash
+python -m py_compile pdf_table_extractor.py training/eval_merge_quality.py training/tune_merge_profiles.py
+python training/eval_merge_quality.py /tmp/merge_eval_sample.json
+python training/tune_merge_profiles.py --help | head -n 40
+```
+
+Interpretation:
+
+- **PASS**: commands run successfully and produce metrics/help output.
+- **WARN**: command runs but reports empty/missing input data (for example, no records found); fix the dataset path and rerun.

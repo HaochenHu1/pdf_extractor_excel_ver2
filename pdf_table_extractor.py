@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import fitz  #PyMuPDF
+from openpyxl.styles import Alignment
 
 @dataclass
 class ExtractedTable:
@@ -120,6 +121,12 @@ def parse_args() -> argparse.Namespace:
         "--verbose",
         action="store_true",
         help="Print extraction progress",
+    )
+    parser.add_argument(
+        "--excel-style-mode",
+        choices=["basic", "off"],
+        default="basic",
+        help="Excel styling mode for merged cells: basic applies centered wrapped labels; off disables extra styling.",
     )
     return parser.parse_args()
 
@@ -873,7 +880,7 @@ def get_available_tesseract_languages() -> set[str]:
 #metadata for each result, such as page number, table index, score, shape, and title.
 #After all sheets are created, the function uses openpyxl to do some light formatting,
 #including adjusting column widths and freezing the top row so the file is easier to read.
-def write_excel(output_path: Path, tables: Sequence[ExtractedTable]) -> None:
+def write_excel(output_path: Path, tables: Sequence[ExtractedTable], excel_style_mode: str = "basic") -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -926,6 +933,9 @@ def write_excel(output_path: Path, tables: Sequence[ExtractedTable]) -> None:
                     end_row=end_row,
                     end_column=end_col,
                 )
+                if excel_style_mode == "basic":
+                    anchor = sheet.cell(row=start_row, column=start_col)
+                    anchor.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
         for sheet in workbook.worksheets:
             for column_cells in sheet.columns:
@@ -1143,7 +1153,7 @@ def main() -> int:
                 failures += 1
                 continue
             output_path = build_output_path(args, input_pdf, batch_mode)
-            write_excel(output_path, extracted)
+            write_excel(output_path, extracted, excel_style_mode=args.excel_style_mode)
             print(f"[OK] {input_pdf.name}: saved {len(extracted)} table(s) to {output_path}")
         except Exception as exc:
             print(f"[FAILED] {input_pdf}: {exc}", file=sys.stderr)
