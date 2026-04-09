@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -178,6 +179,30 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     cleaned = cleaned.reset_index(drop=True)
     cleaned.columns = [f"col_{i+1}" for i in range(cleaned.shape[1])]
     return cleaned
+
+
+def drop_near_duplicate_columns(df: pd.DataFrame, similarity_threshold: float = 0.95) -> pd.DataFrame:
+    if df.empty or df.shape[1] <= 1:
+        return df
+
+    kept_columns: List[str] = []
+    total_rows = max(df.shape[0], 1)
+
+    for col in df.columns:
+        current = df[col].astype(str)
+        is_duplicate = False
+        for kept_col in kept_columns:
+            kept = df[kept_col].astype(str)
+            same_ratio = float((current == kept).sum()) / total_rows
+            if same_ratio >= similarity_threshold:
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            kept_columns.append(col)
+
+    deduped = df.loc[:, kept_columns].copy()
+    deduped.columns = [f"col_{i+1}" for i in range(deduped.shape[1])]
+    return deduped
 
 #Using a score to determine whether a table is too sparse
 def dataframe_filled_ratio(df: pd.DataFrame) -> float:
@@ -446,6 +471,7 @@ def extract_with_img2table(
                 if raw_df is None:
                     continue
                 df = clean_dataframe(pd.DataFrame(raw_df))
+                df = drop_near_duplicate_columns(df)
                 if not looks_like_table(df, min_rows, min_cols, min_filled_ratio):
                     continue
                 score = dataframe_filled_ratio(df)
@@ -485,6 +511,29 @@ def tune_ocr_options(ocr_lang: str, borderless: bool, min_confidence: int, auto_
             tuned_lang = f"{tuned_lang}+eng"
 
     return tuned_lang, tuned_borderless, tuned_confidence, implicit_rows, implicit_columns
+
+
+def get_available_tesseract_languages() -> set[str]:
+    try:
+        result = subprocess.run(
+            ["tesseract", "--list-langs"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return set()
+
+    if result.returncode != 0:
+        return set()
+
+    langs: set[str] = set()
+    for line in result.stdout.splitlines():
+        lang = line.strip()
+        if not lang or lang.startswith("List of available languages"):
+            continue
+        langs.add(lang)
+    return langs
 
 #Exports all extracted tables into a single Excel file
 #It first makes sure the output folder exists, then opens an Excel writer and saves
@@ -552,13 +601,22 @@ def main() -> int:
 
     pdf_kind = detect_pdf_kind(input_pdf)
     log(f"Detected PDF type: {pdf_kind}", args.verbose)
+    ocr_auto_tune = args.ocr_lang_auto
+
+    ocr_lang = args.ocr_lang
+    if not ocr_auto_tune and args.mode == "auto" and pdf_kind == "scanned" and ocr_lang == "eng":
+        available_langs = get_available_tesseract_languages()
+        if "chi_sim" in available_langs and "eng" in available_langs:
+            # For scanned auto mode, bilingual OCR is usually safer than pure English.
+            ocr_lang = "chi_sim+eng"
+
     tuned_ocr_lang, tuned_borderless, tuned_confidence, tuned_implicit_rows, tuned_implicit_columns = tune_ocr_options(
-        args.ocr_lang,
+        ocr_lang,
         args.borderless,
         args.img2table_min_confidence,
-        args.ocr_lang_auto,
+        ocr_auto_tune,
     )
-    if args.ocr_lang_auto:
+    if ocr_auto_tune:
         log(
             (
                 "Auto OCR tuning enabled: "
