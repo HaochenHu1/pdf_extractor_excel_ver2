@@ -1,6 +1,6 @@
 # PDF Table Extractor to Excel
 
-A command-line Python tool that extracts tabular data from PDF documents and exports results to a structured Excel workbook.
+A (small) command-line Python tool that extracts tabular data from PDF documents and exports results to a structured Excel workbook.
 
 This project is designed for practical workflows where PDFs can be either:
 - **Text-based** (machine-readable), or
