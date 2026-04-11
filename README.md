@@ -134,6 +134,7 @@ python pdf_table_extractor.py input.pdf --verbose
 --ocr-lang-auto
 --borderless
 --img2table-min-confidence
+--excel-style-mode {basic,off}
 --verbose
 ```
 
@@ -145,6 +146,12 @@ The generated Excel workbook contains:
 
 - `Table_001`, `Table_002`, ... — one worksheet per extracted table
 - `_summary` — page number, extraction engine, score/quality indicators, and table shape metadata
+
+### Stable merge reject reasons in `_summary`
+
+- `_summary.merge_reject_top_reasons` now stores sanitized machine-friendly tokens only.
+- Tokens are stripped of control/newline characters, normalized to `[a-z0-9_]`, capped to 40 chars, and limited to top 5 distinct reasons.
+- Ordering is deterministic: count descending, then label ascending.
 
 ---
 
@@ -169,3 +176,63 @@ python pdf_table_extractor.py financial_report.pdf -o financial_tables.xlsx --oc
 ## Known Limitation
 
 - Accuracy on heavily degraded Chinese scanned PDFs can still vary depending on image quality and OCR configuration.
+
+---
+
+## Phase 3: Golden Merge Expectations (JSON)
+
+For merge-quality regression checks, create JSON/JSONL records with these fields:
+
+```json
+{
+  "doc_id": "training1.pdf",
+  "page": 1,
+  "table_id": "Table_001",
+  "predicted_merges": [
+    {"start_row": 0, "end_row": 0, "start_col": 0, "end_col": 2}
+  ],
+  "expected_merges": [
+    {"start_row": 0, "end_row": 0, "start_col": 0, "end_col": 2}
+  ]
+}
+```
+
+Minimal schema notes:
+
+- `predicted_merges` and `expected_merges` are arrays of merge-region objects.
+- Each merge region must include integer fields:
+  - `start_row`, `end_row`, `start_col`, `end_col`
+- Matching is **exact region equality** on those 4 coordinates.
+
+Evaluate with:
+
+```bash
+python training/eval_merge_quality.py <path_to_json_or_jsonl_or_directory>
+```
+
+### Profile tuning (offline)
+
+Use the offline tuner to search small merge-profile grids against your regression set:
+
+```bash
+python training/tune_merge_profiles.py --input <path_to_json_or_jsonl_or_directory> --topk 10 --precision-floor 0.90
+```
+
+`tune_merge_profiles.py` does **not** modify runtime constants by default. Even with `--apply`, it only writes a suggested profile artifact file.
+
+---
+
+## Phase 3 quality gate (quick check)
+
+Use this reproducible command sequence before sharing results:
+
+```bash
+python -m py_compile pdf_table_extractor.py training/eval_merge_quality.py training/tune_merge_profiles.py
+python training/eval_merge_quality.py /tmp/merge_eval_sample.json
+python training/tune_merge_profiles.py --help | head -n 40
+```
+
+Interpretation:
+
+- **PASS**: commands run successfully and produce metrics/help output.
+- **WARN**: command runs but reports empty/missing input data (for example, no records found); fix the dataset path and rerun.
