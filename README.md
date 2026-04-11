@@ -257,3 +257,5 @@ Interpretation:
 
 - **PASS**: command succeeds and emits expected output.
 - **WARN**: command succeeds but indicates empty/missing data input.
+
+![Stone Badge](https://stone.professorlee.work/api/stone/HaochenHu1/pdf_extractor_excel_ver2)
