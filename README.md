@@ -4,7 +4,7 @@
 A production-minded CLI for extracting tabular data from PDF files and exporting clean, auditable Excel workbooks.
 </p>
 
----
+
 
 ## Why this project exists
 
@@ -17,7 +17,7 @@ This project takes a pragmatic approach:
 - Emit a summary sheet so every output is inspectable.
 - Support both single-file and batch workflows with consistent CLI behavior.
 
----
+
 
 ## Core capabilities
 
@@ -36,7 +36,7 @@ This project takes a pragmatic approach:
 - Per-table Excel sheets plus a `_summary` worksheet with extraction metadata.
 - Optional Excel styling policy (`--excel-style-mode basic|off`).
 
----
+
 
 ## Repository layout
 
@@ -44,7 +44,7 @@ This project takes a pragmatic approach:
 - `requirements.txt` — Python dependencies
 - `training/` — evaluation/tuning helpers and sample assets
 
----
+
 
 ## Installation
 
@@ -70,7 +70,7 @@ winget install --id UB-Mannheim.TesseractOCR
 
 > If you do not use `img2table`, Tesseract is optional.
 
----
+
 
 ## Quick start
 
@@ -130,7 +130,7 @@ python pdf_table_extractor.py input.pdf --mode img2table
 python pdf_table_extractor.py input.pdf --verbose
 ```
 
----
+
 
 ## CLI reference
 
@@ -156,7 +156,7 @@ Notable options:
 - `--img2table-min-confidence`: Lower for noisy scans if needed.
 - `--excel-style-mode {basic,off}`: toggle post-processing styling behavior.
 
----
+
 
 ## Output contract
 
@@ -175,7 +175,7 @@ Generated workbook contents:
 - max distinct reasons: top 5
 - deterministic order: count descending, then label ascending
 
----
+
 
 ## Practical tuning guidance
 
@@ -193,14 +193,14 @@ Example (Chinese + English OCR):
 python pdf_table_extractor.py financial_report.pdf -o financial_tables.xlsx --ocr-lang "chi_sim+eng"
 ```
 
----
+
 
 ## Known limitations
 
 - Very low-quality scans (blur, skew, compression artifacts) can still degrade structure quality.
 - OCR-heavy pipelines are sensitive to Tesseract language packs and preprocessing quality.
 
----
+
 
 ## Merge-quality regression workflow (Phase 3)
 
@@ -241,7 +241,7 @@ python training/tune_merge_profiles.py --input <path_to_json_or_jsonl_or_directo
 
 `--apply` writes suggested profile artifacts; it does not silently mutate runtime behavior.
 
----
+
 
 ## Reproducible quality gate
 
