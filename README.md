@@ -135,18 +135,22 @@ python pdf_table_extractor.py input.pdf --verbose
 ## CLI reference
 
 ```text
-usage: pdf_table_extractor.py [-h] [-o OUTPUT] [--output-dir OUTPUT_DIR]
-                              [--pages PAGES]
-                              [--mode {auto,camelot,pdfplumber,img2table}]
-                              [--prefer {stream,lattice,both}]
-                              [--min-rows MIN_ROWS] [--min-cols MIN_COLS]
-                              [--min-filled-ratio MIN_FILLED_RATIO]
-                              [--accuracy-threshold ACCURACY_THRESHOLD]
-                              [--ocr-lang OCR_LANG] [--ocr-lang-auto]
-                              [--borderless]
-                              [--img2table-min-confidence IMG2TABLE_MIN_CONFIDENCE]
-                              [--verbose] [--excel-style-mode {basic,off}]
-                              input_path
+-h, --help
+-o, --output
+--output-dir
+--pages
+--mode {auto,camelot,pdfplumber,img2table}
+--prefer {stream,lattice,both}
+--min-rows
+--min-cols
+--min-filled-ratio
+--accuracy-threshold
+--ocr-lang
+--ocr-lang-auto
+--borderless
+--img2table-min-confidence
+--excel-style-mode {basic,off}
+--verbose
 ```
 
 Notable options:
@@ -169,11 +173,13 @@ Generated workbook contents:
 
 `_summary.merge_reject_top_reasons` is normalized for machine consumption:
 
-- control/newline characters removed
-- normalized to `[a-z0-9_]`
-- max token length: 40 chars
-- max distinct reasons: top 5
-- deterministic order: count descending, then label ascending
+### Stable merge reject reasons in `_summary`
+
+- `_summary.merge_reject_top_reasons` now stores sanitized machine-friendly tokens only.
+- Tokens are stripped of control/newline characters, normalized to `[a-z0-9_]`, capped to 40 chars, and limited to top 5 distinct reasons.
+- Ordering is deterministic: count descending, then label ascending.
+
+---
 
 
 
@@ -195,16 +201,13 @@ python pdf_table_extractor.py financial_report.pdf -o financial_tables.xlsx --oc
 
 
 
-## Known limitations
+- Accuracy on heavily degraded Chinese scanned PDFs can still vary depending on image quality and OCR configuration.
 
-- Very low-quality scans (blur, skew, compression artifacts) can still degrade structure quality.
-- OCR-heavy pipelines are sensitive to Tesseract language packs and preprocessing quality.
+---
 
+## Phase 3: Golden Merge Expectations (JSON)
 
-
-## Merge-quality regression workflow (Phase 3)
-
-For regression checks, prepare JSON/JSONL with this shape:
+For merge-quality regression checks, create JSON/JSONL records with these fields:
 
 ```json
 {
@@ -220,32 +223,34 @@ For regression checks, prepare JSON/JSONL with this shape:
 }
 ```
 
-Rules:
+Minimal schema notes:
 
-- `predicted_merges` and `expected_merges` are arrays of region objects.
-- Each region object must include integer values for:
+- `predicted_merges` and `expected_merges` are arrays of merge-region objects.
+- Each merge region must include integer fields:
   - `start_row`, `end_row`, `start_col`, `end_col`
-- Match criterion is exact coordinate equality.
+- Matching is **exact region equality** on those 4 coordinates.
 
-Evaluate:
+Evaluate with:
 
 ```bash
 python training/eval_merge_quality.py <path_to_json_or_jsonl_or_directory>
 ```
 
-Tune offline profile grids:
+### Profile tuning (offline)
+
+Use the offline tuner to search small merge-profile grids against your regression set:
 
 ```bash
 python training/tune_merge_profiles.py --input <path_to_json_or_jsonl_or_directory> --topk 10 --precision-floor 0.90
 ```
 
-`--apply` writes suggested profile artifacts; it does not silently mutate runtime behavior.
+`tune_merge_profiles.py` does **not** modify runtime constants by default. Even with `--apply`, it only writes a suggested profile artifact file.
 
+---
 
+## Phase 3 quality gate (quick check)
 
-## Reproducible quality gate
-
-Run this sequence before sharing outputs:
+Use this reproducible command sequence before sharing results:
 
 ```bash
 python -m py_compile pdf_table_extractor.py training/eval_merge_quality.py training/tune_merge_profiles.py
@@ -255,7 +260,5 @@ python training/tune_merge_profiles.py --help | head -n 40
 
 Interpretation:
 
-- **PASS**: command succeeds and emits expected output.
-- **WARN**: command succeeds but indicates empty/missing data input.
-
-![Stone Badge](https://stone.professorlee.work/api/stone/HaochenHu1/pdf_extractor_excel_ver2)
+- **PASS**: commands run successfully and produce metrics/help output.
+- **WARN**: command runs but reports empty/missing input data (for example, no records found); fix the dataset path and rerun.
