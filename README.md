@@ -1,7 +1,7 @@
-<h1 align="center">PDF Table Extractor → Excel</h1>
+<h1 align="center">PDF Table Extractor</h1>
 
 <p align="center">
-A production-minded CLI for extracting tabular data from PDF files and exporting clean, auditable Excel workbooks.
+A (small) CLI tool for extracting tabular data from PDF files and exporting clean, auditable Excel workbooks.
 </p>
 
 
