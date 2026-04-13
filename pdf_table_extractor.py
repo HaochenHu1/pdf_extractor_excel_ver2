@@ -128,6 +128,31 @@ def parse_args() -> argparse.Namespace:
         default="basic",
         help="Excel styling mode for merged cells: basic applies centered wrapped labels; off disables extra styling.",
     )
+    parser.add_argument(
+        "--row-compact",
+        dest="row_compact",
+        action="store_true",
+        help="Compact sparse continuation/header rows by merging them upward.",
+    )
+    parser.add_argument(
+        "--no-row-compact",
+        dest="row_compact",
+        action="store_false",
+        help="Disable sparse row compaction.",
+    )
+    parser.set_defaults(row_compact=True)
+    parser.add_argument(
+        "--row-compact-empty-ratio",
+        type=float,
+        default=0.8,
+        help="Minimum empty-cell ratio to consider a row sparse for upward compaction.",
+    )
+    parser.add_argument(
+        "--row-compact-header-rows",
+        type=int,
+        default=5,
+        help="Only compact rows within the first N rows (header zone). Use 0 to disable this limit.",
+    )
     return parser.parse_args()
 
 
@@ -184,6 +209,8 @@ def normalize_cell(value: object) -> str:
     text = str(value)
     text = text.replace("\r", " ").replace("\n", " ")
     text = re.sub(r"\s+", " ", text).strip()
+    if text.lower() in {"nan", "none", "null", "<na>"}:
+        return ""
     return text
 
 #Creates a copy of the original table using `copy()`; 
@@ -259,6 +286,58 @@ def looks_like_table(
     if dataframe_filled_ratio(df) < min_filled_ratio:
         return False
     return True
+
+
+def compact_sparse_rows(
+    df: pd.DataFrame,
+    enabled: bool = True,
+    empty_ratio_threshold: float = 0.8,
+    header_rows_limit: int = 5,
+) -> pd.DataFrame:
+    if not enabled or df.empty or df.shape[0] <= 1:
+        return df
+
+    threshold = min(0.99, max(0.0, float(empty_ratio_threshold)))
+    header_limit = max(0, int(header_rows_limit))
+
+    rows = [list(df.iloc[i].astype(str).map(normalize_cell)) for i in range(df.shape[0])]
+    out_rows: List[List[str]] = []
+
+    number_pattern = re.compile(r"^[+-]?\d+(?:[\.,]\d+)?(?:%|[a-zA-Z]+)?$")
+    for row_idx, row in enumerate(rows):
+        if not out_rows:
+            out_rows.append(row)
+            continue
+
+        empties = sum(1 for cell in row if cell == "")
+        empty_ratio = empties / max(len(row), 1)
+        non_empty_cells = [cell for cell in row if cell != ""]
+        numeric_cells = sum(1 for cell in non_empty_cells if number_pattern.match(cell.replace(" ", "")))
+
+        within_header_zone = header_limit == 0 or row_idx < header_limit
+        should_merge_up = (
+            within_header_zone
+            and empty_ratio >= threshold
+            and numeric_cells <= 1
+            and len(non_empty_cells) > 0
+        )
+
+        if not should_merge_up:
+            out_rows.append(row)
+            continue
+
+        prev = out_rows[-1]
+        merged = prev[:]
+        for col_idx, cell in enumerate(row):
+            if cell == "":
+                continue
+            if merged[col_idx] == "":
+                merged[col_idx] = cell
+        out_rows[-1] = merged
+
+    compacted = pd.DataFrame(out_rows, columns=df.columns)
+    compacted = compacted.reset_index(drop=True)
+    return compacted
 
 #Determining if two tables are the same
 #because `auto` mode would make a table repeatedly processed by different modes
@@ -580,6 +659,64 @@ def deduplicate_tables(tables: Sequence[ExtractedTable]) -> List[ExtractedTable]
     deduped.sort(key=lambda t: (t.page, t.engine, -t.score))
     return deduped
 
+
+ENGINE_PRIORITY: Dict[str, int] = {
+    "pdfplumber_s1": 0,
+    "camelot_lattice": 1,
+    "camelot_stream": 2,
+    "pdfplumber_s2": 3,
+    "img2table": 4,
+}
+
+
+def select_best_table_per_page(tables: Sequence[ExtractedTable], verbose: bool = False) -> List[ExtractedTable]:
+    if not tables:
+        return []
+
+    def sort_key(table: ExtractedTable) -> Tuple[int, float, int, int, int, str]:
+        rows, cols = table.df.shape
+        area = rows * cols
+        engine_priority = ENGINE_PRIORITY.get(table.engine, 999)
+        return (
+            table.page,
+            -float(table.score),
+            -area,
+            -rows,
+            engine_priority,
+            table.engine,
+        )
+
+    sorted_tables = sorted(tables, key=sort_key)
+    best_by_page: Dict[int, ExtractedTable] = {}
+    dropped_counts: Counter[int] = Counter()
+
+    for table in sorted_tables:
+        if table.page not in best_by_page:
+            best_by_page[table.page] = table
+        else:
+            dropped_counts[table.page] += 1
+
+    selected = [best_by_page[page] for page in sorted(best_by_page)]
+
+    if verbose:
+        for page in sorted(best_by_page):
+            kept = best_by_page[page]
+            removed = dropped_counts[page]
+            if removed > 0:
+                log(
+                    (
+                        f"Page {page}: kept {kept.engine} (score={kept.score:.4f}); "
+                        f"removed {removed} alternative table(s)."
+                    ),
+                    verbose,
+                )
+        log(
+            f"Selected {len(selected)} table(s) from {len(tables)} candidate(s) using best-per-page filtering.",
+            verbose,
+        )
+
+    return selected
+
 #Determining if a pdf is scanned or text-based
 def detect_pdf_kind(input_pdf: Path, sample_pages: int = 3) -> str:
     doc = fitz.open(input_pdf)
@@ -619,6 +756,9 @@ def extract_with_camelot(
     min_rows: int,
     min_cols: int,
     min_filled_ratio: float,
+    row_compact: bool,
+    row_compact_empty_ratio: float,
+    row_compact_header_rows: int,
     verbose: bool,) -> List[ExtractedTable]:
     try:
         import camelot
@@ -648,6 +788,12 @@ def extract_with_camelot(
         for idx, table in enumerate(tables):
             try:
                 df = clean_dataframe(table.df)
+                df = compact_sparse_rows(
+                    df,
+                    enabled=row_compact,
+                    empty_ratio_threshold=row_compact_empty_ratio,
+                    header_rows_limit=row_compact_header_rows,
+                )
                 report = getattr(table, "parsing_report", {}) or {}
                 accuracy = float(report.get("accuracy", 100.0))
                 page_num = int(report.get("page", pages[0] if pages else 1))
@@ -697,6 +843,9 @@ def extract_with_pdfplumber(
     min_rows: int,
     min_cols: int,
     min_filled_ratio: float,
+    row_compact: bool,
+    row_compact_empty_ratio: float,
+    row_compact_header_rows: int,
     verbose: bool,) -> List[ExtractedTable]:
     try:
         import pdfplumber
@@ -720,6 +869,12 @@ def extract_with_pdfplumber(
                     try:
                         raw_table = table_obj.extract()
                         df = clean_dataframe(pd.DataFrame(raw_table))
+                        df = compact_sparse_rows(
+                            df,
+                            enabled=row_compact,
+                            empty_ratio_threshold=row_compact_empty_ratio,
+                            header_rows_limit=row_compact_header_rows,
+                        )
                         if not looks_like_table(df, min_rows, min_cols, min_filled_ratio):
                             continue
                         score = dataframe_filled_ratio(df)
@@ -765,6 +920,9 @@ def extract_with_img2table(
     min_rows: int,
     min_cols: int,
     min_filled_ratio: float,
+    row_compact: bool,
+    row_compact_empty_ratio: float,
+    row_compact_header_rows: int,
     verbose: bool,) -> List[ExtractedTable]:
     try:
         from img2table.document import PDF as Img2TablePDF
@@ -809,6 +967,12 @@ def extract_with_img2table(
                     continue
                 df = clean_dataframe(pd.DataFrame(raw_df))
                 df = drop_near_duplicate_columns(df)
+                df = compact_sparse_rows(
+                    df,
+                    enabled=row_compact,
+                    empty_ratio_threshold=row_compact_empty_ratio,
+                    header_rows_limit=row_compact_header_rows,
+                )
                 if not looks_like_table(df, min_rows, min_cols, min_filled_ratio):
                     continue
                 score = dataframe_filled_ratio(df)
@@ -1000,6 +1164,9 @@ def extract_tables_for_pdf(input_pdf: Path, args: argparse.Namespace) -> List[Ex
                 args.min_rows,
                 args.min_cols,
                 args.min_filled_ratio,
+                args.row_compact,
+                args.row_compact_empty_ratio,
+                args.row_compact_header_rows,
                 args.verbose,
             )
         )
@@ -1011,6 +1178,9 @@ def extract_tables_for_pdf(input_pdf: Path, args: argparse.Namespace) -> List[Ex
                 args.min_rows,
                 args.min_cols,
                 args.min_filled_ratio,
+                args.row_compact,
+                args.row_compact_empty_ratio,
+                args.row_compact_header_rows,
                 args.verbose,
             )
         )
@@ -1027,6 +1197,9 @@ def extract_tables_for_pdf(input_pdf: Path, args: argparse.Namespace) -> List[Ex
                 args.min_rows,
                 args.min_cols,
                 args.min_filled_ratio,
+                args.row_compact,
+                args.row_compact_empty_ratio,
+                args.row_compact_header_rows,
                 args.verbose,
             )
         )
@@ -1041,6 +1214,9 @@ def extract_tables_for_pdf(input_pdf: Path, args: argparse.Namespace) -> List[Ex
                     args.min_rows,
                     args.min_cols,
                     args.min_filled_ratio,
+                    args.row_compact,
+                    args.row_compact_empty_ratio,
+                    args.row_compact_header_rows,
                     args.verbose,
                 )
             )
@@ -1051,6 +1227,9 @@ def extract_tables_for_pdf(input_pdf: Path, args: argparse.Namespace) -> List[Ex
                     args.min_rows,
                     args.min_cols,
                     args.min_filled_ratio,
+                    args.row_compact,
+                    args.row_compact_empty_ratio,
+                    args.row_compact_header_rows,
                     args.verbose,
                 )
             )
@@ -1068,6 +1247,9 @@ def extract_tables_for_pdf(input_pdf: Path, args: argparse.Namespace) -> List[Ex
                         args.min_rows,
                         args.min_cols,
                         args.min_filled_ratio,
+                        args.row_compact,
+                        args.row_compact_empty_ratio,
+                        args.row_compact_header_rows,
                         args.verbose,
                     )
                 )
@@ -1084,6 +1266,9 @@ def extract_tables_for_pdf(input_pdf: Path, args: argparse.Namespace) -> List[Ex
                     args.min_rows,
                     args.min_cols,
                     args.min_filled_ratio,
+                    args.row_compact,
+                    args.row_compact_empty_ratio,
+                    args.row_compact_header_rows,
                     args.verbose,
                 )
             )
@@ -1094,11 +1279,15 @@ def extract_tables_for_pdf(input_pdf: Path, args: argparse.Namespace) -> List[Ex
                     args.min_rows,
                     args.min_cols,
                     args.min_filled_ratio,
+                    args.row_compact,
+                    args.row_compact_empty_ratio,
+                    args.row_compact_header_rows,
                     args.verbose,
                     )
                 )
 
-    return deduplicate_tables(extracted)
+    deduped = deduplicate_tables(extracted)
+    return select_best_table_per_page(deduped, verbose=args.verbose)
 
 
 def build_output_path(args: argparse.Namespace, input_pdf: Path, batch_mode: bool) -> Path:
