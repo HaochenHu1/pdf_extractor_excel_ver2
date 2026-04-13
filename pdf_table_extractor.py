@@ -580,6 +580,64 @@ def deduplicate_tables(tables: Sequence[ExtractedTable]) -> List[ExtractedTable]
     deduped.sort(key=lambda t: (t.page, t.engine, -t.score))
     return deduped
 
+
+ENGINE_PRIORITY: Dict[str, int] = {
+    "pdfplumber_s1": 0,
+    "camelot_lattice": 1,
+    "camelot_stream": 2,
+    "pdfplumber_s2": 3,
+    "img2table": 4,
+}
+
+
+def select_best_table_per_page(tables: Sequence[ExtractedTable], verbose: bool = False) -> List[ExtractedTable]:
+    if not tables:
+        return []
+
+    def sort_key(table: ExtractedTable) -> Tuple[int, float, int, int, int, str]:
+        rows, cols = table.df.shape
+        area = rows * cols
+        engine_priority = ENGINE_PRIORITY.get(table.engine, 999)
+        return (
+            table.page,
+            -float(table.score),
+            -area,
+            -rows,
+            engine_priority,
+            table.engine,
+        )
+
+    sorted_tables = sorted(tables, key=sort_key)
+    best_by_page: Dict[int, ExtractedTable] = {}
+    dropped_counts: Counter[int] = Counter()
+
+    for table in sorted_tables:
+        if table.page not in best_by_page:
+            best_by_page[table.page] = table
+        else:
+            dropped_counts[table.page] += 1
+
+    selected = [best_by_page[page] for page in sorted(best_by_page)]
+
+    if verbose:
+        for page in sorted(best_by_page):
+            kept = best_by_page[page]
+            removed = dropped_counts[page]
+            if removed > 0:
+                log(
+                    (
+                        f"Page {page}: kept {kept.engine} (score={kept.score:.4f}); "
+                        f"removed {removed} alternative table(s)."
+                    ),
+                    verbose,
+                )
+        log(
+            f"Selected {len(selected)} table(s) from {len(tables)} candidate(s) using best-per-page filtering.",
+            verbose,
+        )
+
+    return selected
+
 #Determining if a pdf is scanned or text-based
 def detect_pdf_kind(input_pdf: Path, sample_pages: int = 3) -> str:
     doc = fitz.open(input_pdf)
@@ -1098,7 +1156,8 @@ def extract_tables_for_pdf(input_pdf: Path, args: argparse.Namespace) -> List[Ex
                     )
                 )
 
-    return deduplicate_tables(extracted)
+    deduped = deduplicate_tables(extracted)
+    return select_best_table_per_page(deduped, verbose=args.verbose)
 
 
 def build_output_path(args: argparse.Namespace, input_pdf: Path, batch_mode: bool) -> Path:
