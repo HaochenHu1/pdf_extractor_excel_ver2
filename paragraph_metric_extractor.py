@@ -125,6 +125,20 @@ def extract_metric_unit(section_text: str, metric: MetricConfig) -> Optional[str
     return raw_unit.strip()
 
 
+def convert_lifeny_to_yuan_per_kwh(
+    value: Optional[float], unit: Optional[str]
+) -> Tuple[Optional[float], Optional[str]]:
+    """Convert 厘/千瓦时 to 元/kWh by dividing numeric value by 1000."""
+
+    if value is None or not unit:
+        return value, unit
+
+    normalized_unit = unit.replace(" ", "")
+    if normalized_unit == "厘/千瓦时":
+        return round(value / 1000.0, 6), "元/kWh"
+    return value, unit
+
+
 def parse_report_date(full_text: str) -> Optional[date]:
     """Parse report date from title format: YYYY年M月 ... （MM.DD）."""
 
@@ -159,11 +173,14 @@ def extract_configured_sections(full_text: str, configs: Iterable[SectionConfig]
         rows: List[Tuple[str, Optional[float], Optional[str], Optional[date]]] = []
 
         for metric in config.metrics:
+            raw_value = extract_metric_value(block, metric)
+            raw_unit = extract_metric_unit(block, metric)
+            converted_value, converted_unit = convert_lifeny_to_yuan_per_kwh(raw_value, raw_unit)
             rows.append(
                 (
                     metric.canonical_name,
-                    extract_metric_value(block, metric),
-                    extract_metric_unit(block, metric),
+                    converted_value,
+                    converted_unit,
                     report_date,
                 )
             )
