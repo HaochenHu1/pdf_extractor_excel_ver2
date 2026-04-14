@@ -130,12 +130,13 @@ def convert_lifeny_to_yuan_per_kwh(
 ) -> Tuple[Optional[float], Optional[str]]:
     """Convert 厘/千瓦时 to 元/kWh by dividing numeric value by 1000."""
 
-    if value is None or not unit:
+    if not unit:
         return value, unit
 
     normalized_unit = unit.replace(" ", "")
     if normalized_unit == "厘/千瓦时":
-        return round(value / 1000.0, 6), "元/kWh"
+        converted_value = round(value / 1000.0, 6) if value is not None else None
+        return converted_value, "元/kWh"
     return value, unit
 
 
