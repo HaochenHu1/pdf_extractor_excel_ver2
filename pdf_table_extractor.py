@@ -12,6 +12,12 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import pandas as pd
 import fitz  #PyMuPDF
 from openpyxl.styles import Alignment
+from paragraph_metric_extractor import (
+    SectionExtractionResult,
+    default_section_configs,
+    demo_extract_market_section_metrics,
+    extract_configured_sections_from_pdf,
+)
 
 @dataclass
 class ExtractedTable:
@@ -152,6 +158,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help="Only compact rows within the first N rows (header zone). Use 0 to disable this limit.",
+    )
+    parser.add_argument(
+        "--demo-section-metrics",
+        action="store_true",
+        help="Run a built-in demo for paragraph metric extraction and exit.",
     )
     return parser.parse_args()
 
@@ -1044,7 +1055,25 @@ def get_available_tesseract_languages() -> set[str]:
 #metadata for each result, such as page number, table index, score, shape, and title.
 #After all sheets are created, the function uses openpyxl to do some light formatting,
 #including adjusting column widths and freezing the top row so the file is easier to read.
-def write_excel(output_path: Path, tables: Sequence[ExtractedTable], excel_style_mode: str = "basic") -> None:
+def _unique_sheet_name(workbook: object, base_name: str) -> str:
+    cleaned = base_name.strip() or "SectionMetrics"
+    cleaned = cleaned[:31]
+    if cleaned not in workbook.sheetnames:
+        return cleaned
+    for idx in range(1, 200):
+        suffix = f"_{idx}"
+        candidate = f"{cleaned[:31 - len(suffix)]}{suffix}"
+        if candidate not in workbook.sheetnames:
+            return candidate
+    return f"Section_{len(workbook.sheetnames) + 1}"[:31]
+
+
+def write_excel(
+    output_path: Path,
+    tables: Sequence[ExtractedTable],
+    excel_style_mode: str = "basic",
+    section_results: Optional[Sequence[SectionExtractionResult]] = None,
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -1082,6 +1111,19 @@ def write_excel(output_path: Path, tables: Sequence[ExtractedTable], excel_style
         summary_df.to_excel(writer, index=False, sheet_name="_summary")
 
         workbook = writer.book
+        if section_results:
+            for section in section_results:
+                section_sheet_name = _unique_sheet_name(workbook, section.sheet_name)
+                rows_df = pd.DataFrame(section.rows, columns=["metric_name", "metric_value"])
+                rows_df.to_excel(
+                    writer,
+                    index=False,
+                    header=False,
+                    sheet_name=section_sheet_name,
+                    startrow=1,
+                )
+                workbook[section_sheet_name]["A1"] = section.section_title
+
         for idx, table in enumerate(tables, start=1):
             sheet = workbook[f"Table_{idx:03d}"]
             for region in infer_merged_regions(table):
@@ -1330,6 +1372,12 @@ def main() -> int:
 
     for input_pdf in input_pdfs:
         try:
+            if args.demo_section_metrics:
+                demo_rows = demo_extract_market_section_metrics()
+                print("[DEMO] Section metric extraction rows:")
+                for name, value in demo_rows:
+                    print(f" - {name}: {value}")
+                return 0
             extracted = extract_tables_for_pdf(input_pdf, args)
             if not extracted:
                 print(
@@ -1341,8 +1389,17 @@ def main() -> int:
                 )
                 failures += 1
                 continue
+            section_results = extract_configured_sections_from_pdf(
+                str(input_pdf),
+                default_section_configs(),
+            )
             output_path = build_output_path(args, input_pdf, batch_mode)
-            write_excel(output_path, extracted, excel_style_mode=args.excel_style_mode)
+            write_excel(
+                output_path,
+                extracted,
+                excel_style_mode=args.excel_style_mode,
+                section_results=section_results,
+            )
             print(f"[OK] {input_pdf.name}: saved {len(extracted)} table(s) to {output_path}")
         except Exception as exc:
             print(f"[FAILED] {input_pdf}: {exc}", file=sys.stderr)
