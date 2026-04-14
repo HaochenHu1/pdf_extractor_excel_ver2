@@ -217,7 +217,8 @@ python pdf_table_extractor.py "./report.pdf" --pages "1-3,5"
 python pdf_table_extractor.py "你的PDF路径" --mode auto
 ```
 
-- 自动选择（默认：先尝试文字方式，必要时再尝试 OCR）
+- 自动选择（可选模式：先尝试文字方式，必要时使用 OCR）
+- **默认模式是 `camelot`（文字型 PDF 优先）**
 
 ```bash
 python pdf_table_extractor.py "你的PDF路径" --mode camelot
