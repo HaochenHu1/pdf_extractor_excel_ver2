@@ -20,7 +20,6 @@ python pdf_table_extractor.py "./pdf_folder" --output-dir "./outcome_folder" --p
 
 > 上面是覆盖大多数参数的一条完整版命令。README 未提到的命令可忽略，这里仅作完整参考。
 
----
 
 ## 2. 使用前说明
 
@@ -38,7 +37,6 @@ python pdf_table_extractor.py "./pdf_folder" --output-dir "./outcome_folder" --p
    - 先按本手册“常见报错”处理
    - 仍无法解决就联系 Haochen
 
----
 
 ## 3. 你只需要知道的文件和目录
 
@@ -53,7 +51,6 @@ python pdf_table_extractor.py "./pdf_folder" --output-dir "./outcome_folder" --p
 - 你的输入 PDF 所在目录
   - 可自行新建，例如 `mypdf/`。
 
----
 
 ## 4. 运行前准备
 
@@ -98,7 +95,6 @@ tesseract --version
 winget install --id UB-Mannheim.TesseractOCR
 ```
 
----
 
 ## 5. 最常用的操作
 
@@ -125,7 +121,6 @@ python pdf_table_extractor.py "./invoice.pdf"
 
 - 默认保存在同目录，文件名类似：`invoice_tables.xlsx`
 
----
 
 ### 命令 2：单个 PDF + 指定输出文件名
 
@@ -145,7 +140,6 @@ python pdf_table_extractor.py "./invoice.pdf" -o "./result/haochen.xlsx"
 
 - 成功时会显示：`[OK] ... saved ... to 你指定的路径`
 
----
 
 ### 命令 3：批量提取（整个文件夹）
 
@@ -174,7 +168,6 @@ python pdf_table_extractor.py "./mypdfs"
 
 - 默认在输入目录下新建：`extracted_tables/`
 
----
 
 ### 命令 4：批量提取 + 指定输出目录
 
@@ -195,7 +188,6 @@ python pdf_table_extractor.py "./daily_pdfs" --output-dir "./haochen"
 
 - `--output-dir` 可用于单文件或批量模式
 
----
 
 ## 6. 其他常用命令
 
