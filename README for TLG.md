@@ -2,8 +2,6 @@
 
 ## 1. 这是什么工具
 
-这个工具用来把 PDF 里的表格提取出来，并保存成 Excel 文件（`.xlsx`）。
-
 你可以处理两类 PDF：
 
 - **文字型 PDF**（可以直接选中文字）
@@ -13,16 +11,6 @@
 
 - 每个识别到的表格会放在一个独立工作表里
 - 同时会生成一个 `_summary` 工作表，记录每个表格来自第几页、使用了哪种识别方式
-
-最适合的场景：
-
-- 发票、报表、清单这类有明显表格结构的 PDF
-
-不擅长的场景：
-
-- 非表格排版（纯段落）
-- 图片质量很差、倾斜严重、遮挡严重的扫描件
-- 非常复杂的跨页表格或手写内容
 
 完整 CLI 示例（按需删减参数）：
 
@@ -44,13 +32,8 @@ python pdf_table_extractor.py "./pdf_folder" --output-dir "./outcome_folder" --p
    - `training/` 目录下所有脚本
 
 2. 不要自行修改高级参数（例如 `--min-rows`、`--min-cols`、`--min-filled-ratio`、`--accuracy-threshold`）。
-   - 需要调整时，请直接联系 Haochen。
 
-3. 任何文件替换前先备份：
-   - 原始 PDF
-   - 旧版输出 Excel
-
-4. 如果终端提示缺少依赖或 OCR 引擎：
+3. 如果终端提示缺少依赖或 OCR 引擎：
    - 不要手动删库
    - 先按本手册“常见报错”处理
    - 仍无法解决就联系 Haochen
@@ -66,7 +49,6 @@ python pdf_table_extractor.py "./pdf_folder" --output-dir "./outcome_folder" --p
   - 依赖清单，安装环境会用到，**不要编辑**。
 
 - `README.md`
-  - 项目说明文档，**可以阅读，不建议随意改**。
 
 - 你的输入 PDF 所在目录
   - 可自行新建，例如 `mypdf/`。
@@ -114,12 +96,6 @@ tesseract --version
 
 ```bash
 winget install --id UB-Mannheim.TesseractOCR
-```
-
-### 4.5 查看命令帮助
-
-```bash
-python pdf_table_extractor.py --help
 ```
 
 ---
@@ -241,7 +217,7 @@ python pdf_table_extractor.py "./report.pdf" --pages "1-3,5"
 python pdf_table_extractor.py "你的PDF路径" --mode auto
 ```
 
-- 自动选择（默认：先尝试文字方式，必要时走 OCR）
+- 自动选择（默认：先尝试文字方式，必要时再尝试 OCR）
 
 ```bash
 python pdf_table_extractor.py "你的PDF路径" --mode camelot
