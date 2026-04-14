@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
@@ -36,11 +37,13 @@ class SectionExtractionResult:
 
     section_title: str
     sheet_name: str
-    rows: Sequence[Tuple[str, Optional[float]]]
+    rows: Sequence[Tuple[str, Optional[float], Optional[str], Optional[date]]]
 
 
 SECTION_HEADING_PATTERN = re.compile(r"(?m)^\s*[一二三四五六七八九十]+、[^\n]{1,60}$")
 NUMBER_PATTERN = r"(?P<value>[+-]?\d+(?:\.\d+)?)"
+UNIT_PATTERN = r"(?P<unit>[^\d，。；;,:：）\(\)\s]+(?:/[^\d，。；;,:：）\(\)\s]+)?)?"
+VALUE_WITH_UNIT_PATTERN = rf"{NUMBER_PATTERN}\s*{UNIT_PATTERN}"
 
 
 def default_number_postprocess(raw: str) -> Optional[float]:
@@ -66,7 +69,7 @@ def build_metric_pattern(metric: MetricConfig) -> re.Pattern[str]:
     pattern = (
         rf"(?:其中)?\s*(?:{alias_part})\s*"
         rf"(?:为|是|：|:)?\s*"
-        rf"{NUMBER_PATTERN}"
+        rf"{VALUE_WITH_UNIT_PATTERN}"
     )
     return re.compile(pattern)
 
@@ -107,18 +110,63 @@ def extract_metric_value(section_text: str, metric: MetricConfig) -> Optional[fl
     return postprocess(raw_value)
 
 
+def extract_metric_unit(section_text: str, metric: MetricConfig) -> Optional[str]:
+    """Extract unit from matched text or fallback to fixed unit from metric config."""
+
+    if metric.unit:
+        return metric.unit
+
+    match = build_metric_pattern(metric).search(section_text)
+    if not match:
+        return None
+    raw_unit = match.groupdict().get("unit")
+    if not raw_unit:
+        return None
+    return raw_unit.strip()
+
+
+def parse_report_date(full_text: str) -> Optional[date]:
+    """Parse report date from title format: YYYY年M月 ... （MM.DD）."""
+
+    year_month_match = re.search(r"(?P<year>\d{4})\s*年\s*(?P<month>\d{1,2})\s*月", full_text)
+    day_hint_match = re.search(r"[（(]\s*(?P<hint_month>\d{1,2})\s*[\.．。/-]\s*(?P<day>\d{1,2})\s*[）)]", full_text)
+    if not year_month_match or not day_hint_match:
+        return None
+
+    year = int(year_month_match.group("year"))
+    title_month = int(year_month_match.group("month"))
+    hinted_month = int(day_hint_match.group("hint_month"))
+    day = int(day_hint_match.group("day"))
+    month = title_month if 1 <= title_month <= 12 else hinted_month
+    if hinted_month == title_month:
+        month = hinted_month
+
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
 def extract_configured_sections(full_text: str, configs: Iterable[SectionConfig]) -> List[SectionExtractionResult]:
     """Extract only configured metrics from configured sections using rule-based regex."""
 
     normalized = normalize_section_text(full_text)
+    report_date = parse_report_date(normalized)
     results: List[SectionExtractionResult] = []
 
     for config in configs:
         block = isolate_section_block(normalized, config.section_title)
-        rows: List[Tuple[str, Optional[float]]] = []
+        rows: List[Tuple[str, Optional[float], Optional[str], Optional[date]]] = []
 
         for metric in config.metrics:
-            rows.append((metric.canonical_name, extract_metric_value(block, metric)))
+            rows.append(
+                (
+                    metric.canonical_name,
+                    extract_metric_value(block, metric),
+                    extract_metric_unit(block, metric),
+                    report_date,
+                )
+            )
 
         results.append(
             SectionExtractionResult(
@@ -144,16 +192,34 @@ def default_section_configs() -> List[SectionConfig]:
     """Default extraction config for currently required section: 二、市场交易情况."""
 
     market_metrics = [
-        MetricConfig(canonical_name="日前总成交电量", aliases=("发电侧日前总成交电量",)),
-        MetricConfig(canonical_name="燃煤", pattern=rf"(?:其中)?\s*燃煤(?!均价)\s*{NUMBER_PATTERN}"),
-        MetricConfig(canonical_name="燃气", pattern=rf"(?:其中)?\s*燃气(?!均价)\s*{NUMBER_PATTERN}"),
-        MetricConfig(canonical_name="核电"),
-        MetricConfig(canonical_name="新能源"),
-        MetricConfig(canonical_name="日前加权平均电价"),
-        MetricConfig(canonical_name="燃煤均价"),
-        MetricConfig(canonical_name="燃气均价"),
-        MetricConfig(canonical_name="日前机组成交价最高", pattern=rf"(?:日前机组成交价)?最高\s*{NUMBER_PATTERN}"),
-        MetricConfig(canonical_name="日前机组成交价最低", pattern=rf"(?:日前机组成交价)?最低\s*{NUMBER_PATTERN}"),
+        MetricConfig(canonical_name="日前总成交电量", aliases=("发电侧日前总成交电量",), unit="亿kWh"),
+        MetricConfig(canonical_name="燃煤", pattern=rf"(?:其中)?\s*燃煤(?!均价)\s*{VALUE_WITH_UNIT_PATTERN}", unit="亿kWh"),
+        MetricConfig(canonical_name="燃气", pattern=rf"(?:其中)?\s*燃气(?!均价)\s*{VALUE_WITH_UNIT_PATTERN}", unit="亿kWh"),
+        MetricConfig(canonical_name="核电", unit="亿kWh"),
+        MetricConfig(canonical_name="新能源", unit="亿kWh"),
+        MetricConfig(canonical_name="日前加权平均电价", unit="厘/千瓦时"),
+        MetricConfig(
+            canonical_name="燃煤均价",
+            aliases=("其中燃煤均价",),
+            pattern=rf"(?:其中)?\s*燃煤均价\s*{VALUE_WITH_UNIT_PATTERN}",
+            unit="厘/千瓦时",
+        ),
+        MetricConfig(
+            canonical_name="燃气均价",
+            aliases=("其中燃气均价",),
+            pattern=rf"(?:其中)?\s*燃气均价\s*{VALUE_WITH_UNIT_PATTERN}",
+            unit="厘/千瓦时",
+        ),
+        MetricConfig(
+            canonical_name="日前机组成交价最高",
+            pattern=rf"(?:日前机组成交价)?最高\s*{VALUE_WITH_UNIT_PATTERN}",
+            unit="厘/千瓦时",
+        ),
+        MetricConfig(
+            canonical_name="日前机组成交价最低",
+            pattern=rf"(?:日前机组成交价)?最低\s*{VALUE_WITH_UNIT_PATTERN}",
+            unit="厘/千瓦时",
+        ),
     ]
     return [
         SectionConfig(
@@ -164,10 +230,11 @@ def default_section_configs() -> List[SectionConfig]:
     ]
 
 
-def demo_extract_market_section_metrics() -> List[Tuple[str, Optional[float]]]:
+def demo_extract_market_section_metrics() -> List[Tuple[str, Optional[float], Optional[str], Optional[date]]]:
     """Demo helper for local verification with the example paragraph provided by user."""
 
     sample_text = (
+        "广东电力现货市场 2026 年 1 月 运行日报（01.05）\n"
         "二、市场交易情况\n"
         "发电侧日前总成交电量16.99亿kWh（其中燃煤10.67亿kWh，燃气2.65亿kWh，"
         "核电2.42亿kWh，新能源1.26亿kWh），日前加权平均电价335.9厘/千瓦时，"

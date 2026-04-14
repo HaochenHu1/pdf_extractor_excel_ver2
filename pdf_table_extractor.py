@@ -1114,7 +1114,10 @@ def write_excel(
         if section_results:
             for section in section_results:
                 section_sheet_name = _unique_sheet_name(workbook, section.sheet_name)
-                rows_df = pd.DataFrame(section.rows, columns=["metric_name", "metric_value"])
+                rows_df = pd.DataFrame(
+                    section.rows,
+                    columns=["metric_name", "metric_value", "metric_unit", "report_date"],
+                )
                 rows_df.to_excel(
                     writer,
                     index=False,
@@ -1123,6 +1126,11 @@ def write_excel(
                     startrow=1,
                 )
                 workbook[section_sheet_name]["A1"] = section.section_title
+                sheet = workbook[section_sheet_name]
+                for row_idx in range(2, 2 + len(rows_df)):
+                    cell = sheet.cell(row=row_idx, column=4)
+                    if cell.value is not None:
+                        cell.number_format = "yyyy-mm-dd"
 
         for idx, table in enumerate(tables, start=1):
             sheet = workbook[f"Table_{idx:03d}"]
@@ -1375,8 +1383,8 @@ def main() -> int:
             if args.demo_section_metrics:
                 demo_rows = demo_extract_market_section_metrics()
                 print("[DEMO] Section metric extraction rows:")
-                for name, value in demo_rows:
-                    print(f" - {name}: {value}")
+                for name, value, unit, report_date in demo_rows:
+                    print(f" - {name}: value={value}, unit={unit}, date={report_date}")
                 return 0
             extracted = extract_tables_for_pdf(input_pdf, args)
             if not extracted:
