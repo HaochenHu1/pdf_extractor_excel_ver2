@@ -118,7 +118,7 @@ python pdf_table_extractor.py input.pdf --pages 1-3,5
 ### Force extraction backend
 
 ```bash
-python pdf_table_extractor.py input.pdf --mode auto
+python pdf_table_extractor.py input.pdf --mode auto  # auto mode (optional)
 python pdf_table_extractor.py input.pdf --mode camelot
 python pdf_table_extractor.py input.pdf --mode pdfplumber
 python pdf_table_extractor.py input.pdf --mode img2table
@@ -140,6 +140,7 @@ python pdf_table_extractor.py input.pdf --verbose
 --output-dir
 --pages
 --mode {auto,camelot,pdfplumber,img2table}
+                        Extraction backend (default: camelot)
 --prefer {stream,lattice,both}
 --min-rows
 --min-cols

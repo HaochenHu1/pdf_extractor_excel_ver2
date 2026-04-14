@@ -63,8 +63,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         choices=["auto", "camelot", "pdfplumber", "img2table"],
-        default="auto",
-        help="Extraction backend selection",
+        default="camelot",
+        help="Extraction backend selection (default: camelot for text-based PDFs)",
     )
     parser.add_argument(
         "--prefer",
