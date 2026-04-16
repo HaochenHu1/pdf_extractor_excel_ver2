@@ -1523,10 +1523,12 @@ def main() -> int:
                 )
                 failures += 1
                 continue
-            section_results = extract_configured_sections_from_pdf(
-                str(input_pdf),
-                default_section_configs(),
-            )
+            section_results: Optional[List[SectionExtractionResult]] = None
+            if not is_monthly_report_filename(input_pdf):
+                section_results = extract_configured_sections_from_pdf(
+                    str(input_pdf),
+                    default_section_configs(),
+                )
             output_path = build_output_path(args, input_pdf, batch_mode)
             write_excel(
                 output_path,
