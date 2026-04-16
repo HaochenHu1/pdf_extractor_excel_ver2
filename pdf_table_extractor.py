@@ -251,6 +251,73 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return cleaned
 
 
+MONTHLY_REPORT_FILENAME_KEYWORD = "广东电力现货市场结算运行情况月报"
+
+
+def is_monthly_report_filename(input_pdf: Path) -> bool:
+    return MONTHLY_REPORT_FILENAME_KEYWORD in input_pdf.stem
+
+
+def find_fubiao1_pages(input_pdf: Path) -> List[int]:
+    pages: List[int] = []
+    try:
+        document = fitz.open(str(input_pdf))
+        for page_idx in range(len(document)):
+            page_text = document[page_idx].get_text("text") or ""
+            if re.search(r"附表\s*1", page_text):
+                pages.append(page_idx + 1)
+        document.close()
+    except Exception:
+        return []
+    return pages
+
+
+def _normalize_fubiao1_text(value: object) -> str:
+    text = normalize_cell(value)
+    text = re.sub(r"(?<=\d)\.\s+(?=\d{1,2}\b)", ".", text)
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
+    text = re.sub(r"#\s+(\d+)", r"#\1", text)
+    return text
+
+
+def postprocess_fubiao1_table(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    fixed = df.copy().map(_normalize_fubiao1_text).reset_index(drop=True)
+    if fixed.shape[0] >= 2:
+        row0 = [str(v).strip() for v in fixed.iloc[0].tolist()]
+        row1 = [str(v).strip() for v in fixed.iloc[1].tolist()]
+        indicator_count = sum(1 for x in row1 if x in {"本月", "同比", "累计"})
+
+        if indicator_count >= 4:
+            for idx in range(4, len(row0)):
+                if row0[idx] == "" and row0[idx - 1] != "":
+                    row0[idx] = row0[idx - 1]
+
+            columns: List[str] = []
+            for idx, sub in enumerate(row1):
+                parent = row0[idx]
+                if idx < 4:
+                    columns.append(parent or sub or f"col_{idx+1}")
+                else:
+                    columns.append(f"{parent}_{sub}" if parent and sub else (parent or sub or f"col_{idx+1}"))
+            deduped_columns: List[str] = []
+            seen: Dict[str, int] = {}
+            for col in columns:
+                seen[col] = seen.get(col, 0) + 1
+                deduped_columns.append(col if seen[col] == 1 else f"{col}_{seen[col]}")
+
+            fixed = fixed.iloc[2:].reset_index(drop=True)
+            fixed.columns = deduped_columns
+
+            identifier_cols = [c for c in fixed.columns[:4]]
+            if identifier_cols:
+                fixed.loc[:, identifier_cols] = fixed.loc[:, identifier_cols].replace("", pd.NA).ffill().fillna("")
+
+    return fixed
+
+
 def drop_near_duplicate_columns(df: pd.DataFrame, similarity_threshold: float = 0.95) -> pd.DataFrame:
     if df.empty or df.shape[1] <= 1:
         return df
@@ -1363,7 +1430,18 @@ def extract_tables_for_pdf(input_pdf: Path, args: argparse.Namespace) -> List[Ex
                 )
 
     deduped = deduplicate_tables(extracted)
-    return select_best_table_per_page(deduped, verbose=args.verbose)
+    selected = select_best_table_per_page(deduped, verbose=args.verbose)
+
+    if is_monthly_report_filename(input_pdf):
+        fubiao1_pages = set(find_fubiao1_pages(input_pdf))
+        if fubiao1_pages:
+            selected = [t for t in selected if t.page in fubiao1_pages]
+        if selected:
+            best = max(selected, key=lambda t: (t.df.shape[1], t.df.shape[0], t.score))
+            best.df = postprocess_fubiao1_table(best.df)
+            return [best]
+
+    return selected
 
 
 def build_output_path(args: argparse.Namespace, input_pdf: Path, batch_mode: bool) -> Path:
@@ -1427,10 +1505,12 @@ def main() -> int:
                 )
                 failures += 1
                 continue
-            section_results = extract_configured_sections_from_pdf(
-                str(input_pdf),
-                default_section_configs(),
-            )
+            section_results: Optional[List[SectionExtractionResult]] = None
+            if not is_monthly_report_filename(input_pdf):
+                section_results = extract_configured_sections_from_pdf(
+                    str(input_pdf),
+                    default_section_configs(),
+                )
             output_path = build_output_path(args, input_pdf, batch_mode)
             write_excel(
                 output_path,
