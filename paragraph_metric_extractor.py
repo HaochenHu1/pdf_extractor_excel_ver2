@@ -40,7 +40,9 @@ class SectionExtractionResult:
     rows: Sequence[Tuple[str, Optional[float], Optional[str], Optional[date]]]
 
 
-SECTION_HEADING_PATTERN = re.compile(r"(?m)^\s*[一二三四五六七八九十]+、[^\n]{1,60}$")
+SECTION_HEADING_PATTERN = re.compile(
+    r"(?m)^\s*(?:[一二三四五六七八九十]+、|[（(][一二三四五六七八九十]+[）)])\s*[^\n]{1,60}$"
+)
 NUMBER_PATTERN = r"(?P<value>[+-]?\d+(?:\.\d+)?)"
 UNIT_PATTERN = r"(?P<unit>[^\d，。；;,:：）\(\)\s]+(?:/[^\d，。；;,:：）\(\)\s]+)?)?"
 VALUE_WITH_UNIT_PATTERN = rf"{NUMBER_PATTERN}\s*{UNIT_PATTERN}"
@@ -207,44 +209,49 @@ def extract_configured_sections_from_pdf(input_pdf_path: str, configs: Iterable[
 
 
 def default_section_configs() -> List[SectionConfig]:
-    """Default extraction config for currently required section: 二、市场交易情况."""
+    """Default extraction config for 当前所需章节：日前市场情况 / 实时市场情况."""
 
-    market_metrics = [
-        MetricConfig(canonical_name="日前总成交电量", aliases=("发电侧日前总成交电量",), unit="亿kWh"),
-        MetricConfig(canonical_name="燃煤", pattern=rf"(?:其中)?\s*燃煤(?!均价)\s*{VALUE_WITH_UNIT_PATTERN}", unit="亿kWh"),
-        MetricConfig(canonical_name="燃气", pattern=rf"(?:其中)?\s*燃气(?!均价)\s*{VALUE_WITH_UNIT_PATTERN}", unit="亿kWh"),
-        MetricConfig(canonical_name="核电", unit="亿kWh"),
-        MetricConfig(canonical_name="新能源", unit="亿kWh"),
-        MetricConfig(canonical_name="日前加权平均电价", unit="厘/千瓦时"),
+    price_metrics = [
         MetricConfig(
-            canonical_name="燃煤均价",
-            aliases=("其中燃煤均价",),
-            pattern=rf"(?:其中)?\s*燃煤均价\s*{VALUE_WITH_UNIT_PATTERN}",
-            unit="厘/千瓦时",
+            canonical_name="发电侧加权平均价格",
+            pattern=rf"发电侧加权平均价格\s*(?:为|是|：|:)?\s*{VALUE_WITH_UNIT_PATTERN}",
+            unit="元/MWh",
         ),
         MetricConfig(
-            canonical_name="燃气均价",
-            aliases=("其中燃气均价",),
-            pattern=rf"(?:其中)?\s*燃气均价\s*{VALUE_WITH_UNIT_PATTERN}",
-            unit="厘/千瓦时",
+            canonical_name="出清电价最大值",
+            pattern=rf"出清电价最大值\s*(?:为|是|：|:)?\s*{VALUE_WITH_UNIT_PATTERN}",
+            unit="元/MWh",
         ),
         MetricConfig(
-            canonical_name="日前机组成交价最高",
-            pattern=rf"(?:日前机组成交价)?最高\s*{VALUE_WITH_UNIT_PATTERN}",
-            unit="厘/千瓦时",
+            canonical_name="出清电价最小值",
+            pattern=rf"出清电价最小值\s*(?:为|是|：|:)?\s*{VALUE_WITH_UNIT_PATTERN}",
+            unit="元/MWh",
         ),
         MetricConfig(
-            canonical_name="日前机组成交价最低",
-            pattern=rf"(?:日前机组成交价)?最低\s*{VALUE_WITH_UNIT_PATTERN}",
-            unit="厘/千瓦时",
+            canonical_name="煤电均价",
+            aliases=("其中煤电均价",),
+            pattern=rf"(?:其中)?\s*煤电均价\s*(?:为|是|：|:)?\s*{VALUE_WITH_UNIT_PATTERN}",
+            unit="元/MWh",
+        ),
+        MetricConfig(
+            canonical_name="气电均价",
+            aliases=("其中气电均价",),
+            pattern=rf"(?:其中)?\s*气电均价\s*(?:为|是|：|:)?\s*{VALUE_WITH_UNIT_PATTERN}",
+            unit="元/MWh",
         ),
     ]
+
     return [
         SectionConfig(
-            section_title="二、市场交易情况",
-            target_sheet_name="市场交易情况",
-            metrics=market_metrics,
-        )
+            section_title="（二）日前市场情况",
+            target_sheet_name="日前市场情况",
+            metrics=price_metrics,
+        ),
+        SectionConfig(
+            section_title="（三）实时市场情况",
+            target_sheet_name="实时市场情况",
+            metrics=price_metrics,
+        ),
     ]
 
 
@@ -253,11 +260,16 @@ def demo_extract_market_section_metrics() -> List[Tuple[str, Optional[float], Op
 
     sample_text = (
         "广东电力现货市场 2026 年 1 月 运行日报（01.05）\n"
-        "二、市场交易情况\n"
-        "发电侧日前总成交电量16.99亿kWh（其中燃煤10.67亿kWh，燃气2.65亿kWh，"
-        "核电2.42亿kWh，新能源1.26亿kWh），日前加权平均电价335.9厘/千瓦时，"
-        "其中燃煤均价336.7厘/千瓦时，燃气均价352.2厘/千瓦时。"
-        "日前机组成交价最高1101.1厘/千瓦时，最低-35厘/千瓦时。"
+        "（二）日前市场情况\n"
+        "3、发电侧平均价格情况\n"
+        "1月发电侧加权平均价格为331元/MWh（包含市场化核电机组、新能源机组），"
+        "出清电价最大值为414元/MWh、最小值为177元/MWh。"
+        "煤电均价342元/MWh，气电均价375元/MWh。\n"
+        "（三）实时市场情况\n"
+        "2、发电侧平均价格情况\n"
+        "1月发电侧加权平均价格为299元/MWh（包含市场化核电机组、新能源机组）；"
+        "出清电价最大值为412元/MWh、最小值为113元/MWh。"
+        "煤电均价315元/MWh，气电均价342元/MWh。"
     )
     extracted = extract_configured_sections(sample_text, default_section_configs())
     return list(extracted[0].rows) if extracted else []
