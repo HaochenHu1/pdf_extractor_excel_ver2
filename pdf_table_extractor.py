@@ -1119,8 +1119,8 @@ def write_excel(
             if day_ahead:
                 day_ahead_df = pd.DataFrame(
                     day_ahead.rows,
-                    columns=["report_month", "metric_name", "metric_value", "metric_unit", "report_date"],
-                )[["report_month", "metric_name", "metric_value", "metric_unit"]]
+                    columns=["title_month_date", "metric_name", "metric_value", "metric_unit", "report_date"],
+                )[["title_month_date", "metric_name", "metric_value", "metric_unit"]]
                 day_ahead_df.to_excel(
                     writer,
                     index=False,
@@ -1132,8 +1132,8 @@ def write_excel(
             if real_time:
                 real_time_df = pd.DataFrame(
                     real_time.rows,
-                    columns=["report_month", "metric_name", "metric_value", "metric_unit", "report_date"],
-                )[["report_month", "metric_name", "metric_value", "metric_unit"]]
+                    columns=["title_month_date", "metric_name", "metric_value", "metric_unit", "report_date"],
+                )[["title_month_date", "metric_name", "metric_value", "metric_unit"]]
                 real_time_df.to_excel(
                     writer,
                     index=False,
@@ -1147,6 +1147,16 @@ def write_excel(
                 sheet = workbook[section_sheet_name]
                 sheet["A1"] = "（二）日前市场情况"
                 sheet["F1"] = "（三）实时市场情况"
+                if day_ahead:
+                    for row_idx in range(2, 2 + len(day_ahead.rows)):
+                        cell = sheet.cell(row=row_idx, column=1)
+                        if cell.value is not None:
+                            cell.number_format = "yyyy-mm"
+                if real_time:
+                    for row_idx in range(2, 2 + len(real_time.rows)):
+                        cell = sheet.cell(row=row_idx, column=6)
+                        if cell.value is not None:
+                            cell.number_format = "yyyy-mm"
 
         for idx, table in enumerate(tables, start=1):
             sheet = workbook[f"Table_{idx:03d}"]
@@ -1401,9 +1411,9 @@ def main() -> int:
                 print("[DEMO] Section metric extraction rows:")
                 for section in demo_sections:
                     print(f" [{section.section_title}]")
-                    for report_month, name, value, unit, report_date in section.rows:
+                    for title_month_date, name, value, unit, report_date in section.rows:
                         print(
-                            f" - month={report_month}, metric={name}, value={value}, unit={unit}, date={report_date}"
+                            f" - title_month_date={title_month_date}, metric={name}, value={value}, unit={unit}, date={report_date}"
                         )
                 return 0
             extracted = extract_tables_for_pdf(input_pdf, args)

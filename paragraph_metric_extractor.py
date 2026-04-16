@@ -37,7 +37,7 @@ class SectionExtractionResult:
 
     section_title: str
     sheet_name: str
-    rows: Sequence[Tuple[Optional[int], str, Optional[float], Optional[str], Optional[date]]]
+    rows: Sequence[Tuple[Optional[date], str, Optional[float], Optional[str], Optional[date]]]
 
 
 SECTION_HEADING_PATTERN = re.compile(
@@ -80,6 +80,7 @@ def normalize_section_text(text: str) -> str:
     """Normalize common OCR spacing/punctuation noise for stable regex matching."""
 
     cleaned = text.replace("\u3000", " ").replace("\xa0", " ")
+    cleaned = re.sub(r"(?<=[\u4e00-\u9fff])\s*\n\s*(?=[\u4e00-\u9fff])", "", cleaned)
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
     cleaned = re.sub(r"\s*([，。；：:（）()、])\s*", r"\1", cleaned)
     return cleaned
@@ -164,14 +165,17 @@ def parse_report_date(full_text: str) -> Optional[date]:
         return None
 
 
-def parse_report_month(full_text: str) -> Optional[int]:
-    """Parse report month from title format: YYYY年M月."""
+def parse_report_month(full_text: str) -> Optional[date]:
+    """Parse report title month from format YYYY年M月 and return YYYY-MM-01."""
 
     year_month_match = re.search(r"(?P<year>\d{4})\s*年\s*(?P<month>\d{1,2})\s*月", full_text)
     if not year_month_match:
         return None
+    year = int(year_month_match.group("year"))
     month = int(year_month_match.group("month"))
-    return month if 1 <= month <= 12 else None
+    if not (1 <= month <= 12):
+        return None
+    return date(year, month, 1)
 
 
 def extract_configured_sections(full_text: str, configs: Iterable[SectionConfig]) -> List[SectionExtractionResult]:
@@ -184,7 +188,7 @@ def extract_configured_sections(full_text: str, configs: Iterable[SectionConfig]
 
     for config in configs:
         block = isolate_section_block(normalized, config.section_title)
-        rows: List[Tuple[Optional[int], str, Optional[float], Optional[str], Optional[date]]] = []
+        rows: List[Tuple[Optional[date], str, Optional[float], Optional[str], Optional[date]]] = []
 
         for metric in config.metrics:
             raw_value = extract_metric_value(block, metric)
@@ -231,12 +235,12 @@ def default_section_configs() -> List[SectionConfig]:
         ),
         MetricConfig(
             canonical_name="出清电价最大值",
-            pattern=rf"(?:出清电价)?最大值\s*(?:为|是|：|:)?\s*{VALUE_WITH_UNIT_PATTERN}",
+            pattern=rf"(?:出清电价)?最\s*大值\s*(?:为|是|：|:)?\s*{VALUE_WITH_UNIT_PATTERN}",
             unit="元/MWh",
         ),
         MetricConfig(
             canonical_name="出清电价最小值",
-            pattern=rf"(?:出清电价)?最小值\s*(?:为|是|：|:)?\s*{VALUE_WITH_UNIT_PATTERN}",
+            pattern=rf"(?:出清电价)?最\s*小值\s*(?:为|是|：|:)?\s*{VALUE_WITH_UNIT_PATTERN}",
             unit="元/MWh",
         ),
         MetricConfig(
@@ -275,12 +279,12 @@ def demo_extract_market_section_metrics() -> List[SectionExtractionResult]:
         "（二）日前市场情况\n"
         "3、发电侧平均价格情况\n"
         "1月发电侧加权平均价格为331元/MWh（包含市场化核电机组、新能源机组），"
-        "出清电价最大值为414元/MWh、最小值为177元/MWh。"
+        "出清电价最\n大值为414元/MWh、最小值为177元/MWh。"
         "煤电均价342元/MWh，气电均价375元/MWh。\n"
         "（三）实时市场情况\n"
         "2、发电侧平均价格情况\n"
         "1月发电侧加权平均价格为299元/MWh（包含市场化核电机组、新能源机组）；"
-        "出清电价最大值为412元/MWh、最小值为113元/MWh。"
+        "出清电价最\n大值为412元/MWh、最小值为113元/MWh。"
         "煤电均价315元/MWh，气电均价342元/MWh。"
     )
     return extract_configured_sections(sample_text, default_section_configs())
