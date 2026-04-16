@@ -37,7 +37,7 @@ class SectionExtractionResult:
 
     section_title: str
     sheet_name: str
-    rows: Sequence[Tuple[str, Optional[float], Optional[str], Optional[date]]]
+    rows: Sequence[Tuple[Optional[int], str, Optional[float], Optional[str], Optional[date]]]
 
 
 SECTION_HEADING_PATTERN = re.compile(
@@ -164,16 +164,27 @@ def parse_report_date(full_text: str) -> Optional[date]:
         return None
 
 
+def parse_report_month(full_text: str) -> Optional[int]:
+    """Parse report month from title format: YYYY年M月."""
+
+    year_month_match = re.search(r"(?P<year>\d{4})\s*年\s*(?P<month>\d{1,2})\s*月", full_text)
+    if not year_month_match:
+        return None
+    month = int(year_month_match.group("month"))
+    return month if 1 <= month <= 12 else None
+
+
 def extract_configured_sections(full_text: str, configs: Iterable[SectionConfig]) -> List[SectionExtractionResult]:
     """Extract only configured metrics from configured sections using rule-based regex."""
 
     normalized = normalize_section_text(full_text)
     report_date = parse_report_date(normalized)
+    report_month = parse_report_month(normalized)
     results: List[SectionExtractionResult] = []
 
     for config in configs:
         block = isolate_section_block(normalized, config.section_title)
-        rows: List[Tuple[str, Optional[float], Optional[str], Optional[date]]] = []
+        rows: List[Tuple[Optional[int], str, Optional[float], Optional[str], Optional[date]]] = []
 
         for metric in config.metrics:
             raw_value = extract_metric_value(block, metric)
@@ -181,6 +192,7 @@ def extract_configured_sections(full_text: str, configs: Iterable[SectionConfig]
             converted_value, converted_unit = convert_lifeny_to_yuan_per_kwh(raw_value, raw_unit)
             rows.append(
                 (
+                    report_month,
                     metric.canonical_name,
                     converted_value,
                     converted_unit,
@@ -219,12 +231,12 @@ def default_section_configs() -> List[SectionConfig]:
         ),
         MetricConfig(
             canonical_name="出清电价最大值",
-            pattern=rf"出清电价最大值\s*(?:为|是|：|:)?\s*{VALUE_WITH_UNIT_PATTERN}",
+            pattern=rf"(?:出清电价)?最大值\s*(?:为|是|：|:)?\s*{VALUE_WITH_UNIT_PATTERN}",
             unit="元/MWh",
         ),
         MetricConfig(
             canonical_name="出清电价最小值",
-            pattern=rf"出清电价最小值\s*(?:为|是|：|:)?\s*{VALUE_WITH_UNIT_PATTERN}",
+            pattern=rf"(?:出清电价)?最小值\s*(?:为|是|：|:)?\s*{VALUE_WITH_UNIT_PATTERN}",
             unit="元/MWh",
         ),
         MetricConfig(
@@ -255,11 +267,11 @@ def default_section_configs() -> List[SectionConfig]:
     ]
 
 
-def demo_extract_market_section_metrics() -> List[Tuple[str, Optional[float], Optional[str], Optional[date]]]:
-    """Demo helper for local verification with the example paragraph provided by user."""
+def demo_extract_market_section_metrics() -> List[SectionExtractionResult]:
+    """Demo helper for local verification with examples for 日前/实时 sections."""
 
     sample_text = (
-        "广东电力现货市场 2026 年 1 月 运行日报（01.05）\n"
+        "广东电力现货市场结算运行情况月报（2026年1月)\n"
         "（二）日前市场情况\n"
         "3、发电侧平均价格情况\n"
         "1月发电侧加权平均价格为331元/MWh（包含市场化核电机组、新能源机组），"
@@ -271,5 +283,4 @@ def demo_extract_market_section_metrics() -> List[Tuple[str, Optional[float], Op
         "出清电价最大值为412元/MWh、最小值为113元/MWh。"
         "煤电均价315元/MWh，气电均价342元/MWh。"
     )
-    extracted = extract_configured_sections(sample_text, default_section_configs())
-    return list(extracted[0].rows) if extracted else []
+    return extract_configured_sections(sample_text, default_section_configs())

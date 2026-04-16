@@ -1112,25 +1112,41 @@ def write_excel(
 
         workbook = writer.book
         if section_results:
-            for section in section_results:
-                section_sheet_name = _unique_sheet_name(workbook, section.sheet_name)
-                rows_df = pd.DataFrame(
-                    section.rows,
-                    columns=["metric_name", "metric_value", "metric_unit", "report_date"],
-                )
-                rows_df.to_excel(
+            section_sheet_name = _unique_sheet_name(workbook, "市场情况")
+            day_ahead = next((s for s in section_results if s.section_title == "（二）日前市场情况"), None)
+            real_time = next((s for s in section_results if s.section_title == "（三）实时市场情况"), None)
+
+            if day_ahead:
+                day_ahead_df = pd.DataFrame(
+                    day_ahead.rows,
+                    columns=["report_month", "metric_name", "metric_value", "metric_unit", "report_date"],
+                )[["report_month", "metric_name", "metric_value", "metric_unit"]]
+                day_ahead_df.to_excel(
                     writer,
                     index=False,
                     header=False,
                     sheet_name=section_sheet_name,
                     startrow=1,
+                    startcol=0,
                 )
-                workbook[section_sheet_name]["A1"] = section.section_title
+            if real_time:
+                real_time_df = pd.DataFrame(
+                    real_time.rows,
+                    columns=["report_month", "metric_name", "metric_value", "metric_unit", "report_date"],
+                )[["report_month", "metric_name", "metric_value", "metric_unit"]]
+                real_time_df.to_excel(
+                    writer,
+                    index=False,
+                    header=False,
+                    sheet_name=section_sheet_name,
+                    startrow=1,
+                    startcol=5,
+                )
+
+            if day_ahead or real_time:
                 sheet = workbook[section_sheet_name]
-                for row_idx in range(2, 2 + len(rows_df)):
-                    cell = sheet.cell(row=row_idx, column=4)
-                    if cell.value is not None:
-                        cell.number_format = "yyyy-mm-dd"
+                sheet["A1"] = "（二）日前市场情况"
+                sheet["F1"] = "（三）实时市场情况"
 
         for idx, table in enumerate(tables, start=1):
             sheet = workbook[f"Table_{idx:03d}"]
@@ -1381,10 +1397,14 @@ def main() -> int:
     for input_pdf in input_pdfs:
         try:
             if args.demo_section_metrics:
-                demo_rows = demo_extract_market_section_metrics()
+                demo_sections = demo_extract_market_section_metrics()
                 print("[DEMO] Section metric extraction rows:")
-                for name, value, unit, report_date in demo_rows:
-                    print(f" - {name}: value={value}, unit={unit}, date={report_date}")
+                for section in demo_sections:
+                    print(f" [{section.section_title}]")
+                    for report_month, name, value, unit, report_date in section.rows:
+                        print(
+                            f" - month={report_month}, metric={name}, value={value}, unit={unit}, date={report_date}"
+                        )
                 return 0
             extracted = extract_tables_for_pdf(input_pdf, args)
             if not extracted:
