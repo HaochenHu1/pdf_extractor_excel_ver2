@@ -439,6 +439,139 @@ def postprocess_tables_for_monthly_report(tables: Sequence[ExtractedTable]) -> L
     return processed
 
 
+def _compact_row_signature(row: Sequence[object]) -> str:
+    return "|".join(re.sub(r"\s+", "", normalize_cell(value)) for value in row)
+
+
+def _is_header_like_row(row: Sequence[object]) -> bool:
+    row_text = _compact_row_signature(row)
+    if not row_text:
+        return False
+    header_markers = ("序号", "名称", "机组编号", "单机容量", "本月", "同比", "累计", "小时", "次数", "成功率")
+    marker_hits = sum(1 for marker in header_markers if marker in row_text)
+    return marker_hits >= 1
+
+
+def _attach1_table_title_signal(table: ExtractedTable) -> bool:
+    if (table.title or "") == "附表1":
+        return True
+    return _looks_like_monthly_attach1_table(table.df)
+
+
+def _table_starts_new_attach_table(df: pd.DataFrame) -> bool:
+    if df.empty:
+        return False
+    head_text = "".join(
+        re.sub(r"\s+", "", normalize_cell(df.iat[r, c]))
+        for r in range(min(3, df.shape[0]))
+        for c in range(df.shape[1])
+    )
+    return bool(re.search(r"附表[2-9]", head_text))
+
+
+def _drop_repeated_attach1_headers(base_df: pd.DataFrame, next_df: pd.DataFrame) -> pd.DataFrame:
+    if base_df.empty or next_df.empty:
+        return next_df
+    base_header_rows = min(max(_extract_attach1_header_rows(base_df), 1), 5, base_df.shape[0])
+    candidate_rows = min(base_header_rows, 5, next_df.shape[0])
+    drop_count = 0
+    for row_idx in range(candidate_rows):
+        if not _is_header_like_row(next_df.iloc[row_idx].tolist()):
+            break
+        base_row = base_df.iloc[min(row_idx, base_header_rows - 1)].tolist()
+        next_row = next_df.iloc[row_idx].tolist()
+        if _compact_row_signature(base_row) == _compact_row_signature(next_row):
+            drop_count = row_idx + 1
+            continue
+        break
+    if drop_count <= 0:
+        return next_df
+    return next_df.iloc[drop_count:].reset_index(drop=True)
+
+
+def _merge_split_row_across_pages(base_df: pd.DataFrame, next_df: pd.DataFrame) -> pd.DataFrame:
+    if base_df.empty or next_df.empty:
+        return next_df
+    shared_cols = [col for col in base_df.columns if col in next_df.columns]
+    if not shared_cols:
+        return next_df
+    left_cols = [col for col in ("序号", "名称", "机组编号") if col in shared_cols]
+    if not left_cols:
+        left_cols = shared_cols[: min(3, len(shared_cols))]
+
+    last_row = base_df.iloc[-1]
+    first_row = next_df.iloc[0]
+    last_left_values = [normalize_cell(last_row[col]) for col in left_cols]
+    first_left_values = [normalize_cell(first_row[col]) for col in left_cols]
+    last_left_empty = sum(1 for value in last_left_values if value == "")
+    first_left_empty = sum(1 for value in first_left_values if value == "")
+    if last_left_empty == 0 and first_left_empty == 0:
+        return next_df
+
+    merged_any = False
+    merged_row = last_row.copy()
+    for col in shared_cols:
+        last_val = normalize_cell(last_row[col])
+        first_val = normalize_cell(first_row[col])
+        merged_val = None
+        if last_val.endswith(".") and re.fullmatch(r"\d{1,3}", first_val):
+            merged_val = f"{last_val}{first_val}"
+        elif last_val and first_val == "%" and re.fullmatch(r"\d+(?:\.\d+)?", last_val):
+            merged_val = f"{last_val}%"
+        elif not last_val and first_val:
+            merged_val = first_val
+        elif last_val and first_val and last_val != first_val and col in left_cols:
+            merged_val = f"{last_val}{first_val}"
+        if merged_val is not None:
+            merged_row[col] = merged_val
+            merged_any = True
+
+    if not merged_any:
+        return next_df
+    base_df.iloc[-1] = merged_row
+    return next_df.iloc[1:].reset_index(drop=True)
+
+
+def stitch_attach1_across_pages(tables: Sequence[ExtractedTable]) -> List[ExtractedTable]:
+    if not tables:
+        return []
+    sorted_tables = sorted(tables, key=lambda table: (table.page, -table.score))
+    attach1_candidates = [table for table in sorted_tables if _attach1_table_title_signal(table)]
+    if not attach1_candidates:
+        attach1_candidates = sorted_tables[:1]
+    if not attach1_candidates:
+        return []
+
+    stitched_table = attach1_candidates[0]
+    stitched_df = stitched_table.df.copy()
+    last_page = stitched_table.page
+    for table in attach1_candidates[1:]:
+        if table.page != last_page + 1:
+            break
+        if stitched_df.shape[1] != table.df.shape[1]:
+            break
+        if _table_starts_new_attach_table(table.df):
+            break
+        next_df = _drop_repeated_attach1_headers(stitched_df, table.df.copy())
+        next_df = _merge_split_row_across_pages(stitched_df, next_df)
+        if next_df.empty:
+            last_page = table.page
+            continue
+        stitched_df = pd.concat([stitched_df, next_df], ignore_index=True)
+        last_page = table.page
+
+    return [
+        ExtractedTable(
+            df=stitched_df.reset_index(drop=True),
+            page=stitched_table.page,
+            engine=stitched_table.engine,
+            score=stitched_table.score,
+            title="附表1",
+            layout_meta=stitched_table.layout_meta,
+        )
+    ]
+
+
 def _attach1_keyword_hits(df: pd.DataFrame) -> int:
     if df.empty:
         return 0
@@ -451,18 +584,18 @@ def _attach1_keyword_hits(df: pd.DataFrame) -> int:
     return sum(1 for keyword in keywords if keyword in header_text)
 
 
-def extract_attach1_with_border_grid(input_pdf: Path, verbose: bool = False) -> Optional[ExtractedTable]:
+def extract_attach1_with_border_grid(input_pdf: Path, verbose: bool = False) -> List[ExtractedTable]:
     try:
         document = fitz.open(str(input_pdf))
     except Exception:
-        return None
+        return []
 
-    best_candidate: Optional[ExtractedTable] = None
-    best_hits = -1
+    candidates_by_page: Dict[int, ExtractedTable] = {}
     try:
         for page_idx, page in enumerate(document):
             page_text = page.get_text("text") or ""
-            if "附表1" not in page_text:
+            page_has_attach1_title = "附表1" in page_text
+            if not page_has_attach1_title and not candidates_by_page:
                 continue
 
             for strategy in ("lines_strict", "lines"):
@@ -508,7 +641,7 @@ def extract_attach1_with_border_grid(input_pdf: Path, verbose: bool = False) -> 
                         continue
                     df = pd.DataFrame(grid_values)
                     hits = _attach1_keyword_hits(df)
-                    if hits < 4:
+                    if hits < (4 if page_has_attach1_title else 5):
                         continue
 
                     layout_meta = _finalize_layout_meta(raw_cells, df.shape[0], df.shape[1], f"pymupdf_{strategy}")
@@ -520,43 +653,21 @@ def extract_attach1_with_border_grid(input_pdf: Path, verbose: bool = False) -> 
                         title="附表1",
                         layout_meta=layout_meta,
                     )
-                    if hits > best_hits:
-                        best_candidate = candidate
-                        best_hits = hits
-                if best_candidate is not None:
-                    break
+                    previous = candidates_by_page.get(page_idx + 1)
+                    if previous is None or candidate.score > previous.score:
+                        candidates_by_page[page_idx + 1] = candidate
     finally:
         document.close()
 
-    if best_candidate and verbose:
-        print(
-            f"[{input_pdf.name}] 附表1 border-grid candidate page={best_candidate.page}, engine={best_candidate.engine}, score={best_candidate.score}"
-        )
-    return best_candidate
+    candidates = [candidates_by_page[page] for page in sorted(candidates_by_page)]
+    if candidates and verbose:
+        pages_text = ", ".join(str(candidate.page) for candidate in candidates)
+        print(f"[{input_pdf.name}] 附表1 border-grid candidate pages={pages_text}")
+    return candidates
 
 
 def select_attach1_tables_for_monthly_report(tables: Sequence[ExtractedTable]) -> List[ExtractedTable]:
-    attach1_candidates = [table for table in tables if _looks_like_monthly_attach1_table(table.df)]
-    if attach1_candidates:
-        attach1_candidates = sorted(
-            attach1_candidates,
-            key=lambda table: (table.page, -table.score, -(table.df.shape[0] * table.df.shape[1])),
-        )
-        selected = attach1_candidates[0]
-    elif tables:
-        selected = sorted(tables, key=lambda table: (table.page, -table.score))[0]
-    else:
-        return []
-    return [
-        ExtractedTable(
-            df=selected.df,
-            page=selected.page,
-            engine=selected.engine,
-            score=selected.score,
-            title="附表1",
-            layout_meta=selected.layout_meta,
-        )
-    ]
+    return stitch_attach1_across_pages(tables)
 
 
 def drop_near_duplicate_columns(df: pd.DataFrame, similarity_threshold: float = 0.95) -> pd.DataFrame:
@@ -1376,6 +1487,20 @@ def _unique_sheet_name(workbook: object, base_name: str) -> str:
     return f"Section_{len(workbook.sheetnames) + 1}"[:31]
 
 
+def remove_all_whitespace_in_strings(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    cleaned = df.copy()
+    cleaned = cleaned.map(
+        lambda value: (
+            re.sub(r"[\s\u00a0\u3000]+", "", value)
+            if isinstance(value, str)
+            else value
+        )
+    )
+    return cleaned
+
+
 def write_excel(
     output_path: Path,
     tables: Sequence[ExtractedTable],
@@ -1391,7 +1516,8 @@ def write_excel(
         summary_rows = []
         for idx, table in enumerate(tables, start=1):
             sheet_name = f"{table_sheet_base_name}_{idx:03d}" if table_sheet_base_name != "附表1" else "附表1"
-            table.df.to_excel(writer, index=False, header=table_write_header, sheet_name=sheet_name)
+            final_df = remove_all_whitespace_in_strings(table.df)
+            final_df.to_excel(writer, index=False, header=table_write_header, sheet_name=sheet_name)
             merged_regions = infer_merged_regions(table)
             merge_conf_avg = (
                 round(sum(float(m["confidence"]) for m in merged_regions) / len(merged_regions), 4)
@@ -1433,6 +1559,7 @@ def write_excel(
                     day_ahead.rows,
                     columns=["title_month_date", "metric_name", "metric_value", "metric_unit", "report_date"],
                 )[["title_month_date", "metric_name", "metric_value", "metric_unit"]]
+                day_ahead_df = remove_all_whitespace_in_strings(day_ahead_df)
                 day_ahead_df.to_excel(
                     writer,
                     index=False,
@@ -1446,6 +1573,7 @@ def write_excel(
                     real_time.rows,
                     columns=["title_month_date", "metric_name", "metric_value", "metric_unit", "report_date"],
                 )[["title_month_date", "metric_name", "metric_value", "metric_unit"]]
+                real_time_df = remove_all_whitespace_in_strings(real_time_df)
                 real_time_df.to_excel(
                     writer,
                     index=False,
@@ -1737,9 +1865,9 @@ def main() -> int:
             monthly_report = is_monthly_report_file(input_pdf)
             extracted: List[ExtractedTable] = []
             if monthly_report:
-                attach1_border_table = extract_attach1_with_border_grid(input_pdf, args.verbose)
-                if attach1_border_table is not None:
-                    extracted = [attach1_border_table]
+                attach1_border_tables = extract_attach1_with_border_grid(input_pdf, args.verbose)
+                if attach1_border_tables:
+                    extracted = attach1_border_tables
 
             if not extracted:
                 extracted = extract_tables_for_pdf(input_pdf, args)
