@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import fitz  #PyMuPDF
+from openpyxl.utils import get_column_letter
 from openpyxl.styles import Alignment
 from paragraph_metric_extractor import (
     SectionExtractionResult,
@@ -227,8 +228,10 @@ def normalize_cell(value: object) -> str:
 
 def normalize_split_numeric_fragments(text: str) -> str:
     normalized = text
+    normalized = re.sub(r"(?<!\d)(\d+)\s*\.\s+(\d{1,3})(?!\d)", r"\1.\2", normalized)
     normalized = re.sub(r"(\d+\.)\s+(\d{1,3})\b", r"\1\2", normalized)
     normalized = re.sub(r"(\d+\.\d)\s+(\d)\b", r"\1\2", normalized)
+    normalized = re.sub(r"(\d+\.\d{2})\s+([%‰])\b", r"\1\2", normalized)
     normalized = re.sub(r"(\d)\s+(\d{3}(?:\.\d+)?)\b", r"\1\2", normalized)
     normalized = re.sub(r"(\d),\s+(\d{3}\b)", r"\1,\2", normalized)
     return normalized.strip()
@@ -266,8 +269,9 @@ def _looks_like_monthly_attach1_table(df: pd.DataFrame) -> bool:
     header_zone = " ".join(
         normalize_cell(df.iat[r, c]) for r in range(min(6, df.shape[0])) for c in range(df.shape[1])
     )
+    compact_zone = re.sub(r"\s+", "", header_zone)
     keywords = ("附表1", "序号", "机组编号", "单机容量", "总运行小时", "发电小时")
-    return sum(1 for keyword in keywords if keyword in header_zone) >= 3
+    return sum(1 for keyword in keywords if keyword in compact_zone) >= 2
 
 
 def _extract_attach1_header_rows(df: pd.DataFrame, max_header_rows: int = 5) -> int:
@@ -275,6 +279,7 @@ def _extract_attach1_header_rows(df: pd.DataFrame, max_header_rows: int = 5) -> 
     for row_idx in range(min(max_header_rows, df.shape[0])):
         row_values = [normalize_cell(v) for v in df.iloc[row_idx].tolist()]
         row_text = " ".join(v for v in row_values if v)
+        compact_row_text = re.sub(r"\s+", "", row_text)
         if not row_text:
             continue
         non_empty_count = len([v for v in row_values if v])
@@ -282,7 +287,7 @@ def _extract_attach1_header_rows(df: pd.DataFrame, max_header_rows: int = 5) -> 
         marker_hit = sum(
             1
             for marker in ("序号", "名称", "机组编号", "单机容量", "本月", "同比", "累计", "小时", "次数", "成功率")
-            if marker in row_text
+            if marker in compact_row_text
         )
         if marker_hit >= 1 and numeric_cells <= max(1, non_empty_count // 2):
             header_rows = row_idx + 1
@@ -294,10 +299,29 @@ def _extract_attach1_header_rows(df: pd.DataFrame, max_header_rows: int = 5) -> 
 def _rebuild_attach1_column_names(df: pd.DataFrame, header_rows: int) -> List[str]:
     metric_keywords = ["总运行小时", "发电小时", "抽水小时", "发电调相", "抽水调相", "等效可用系数", "启停次数", "启停成功率", "等效强迫停运率"]
     sub_keywords = ["本月", "同比", "累计"]
+    header_matrix: List[List[str]] = []
+    for row_idx in range(min(header_rows, df.shape[0])):
+        row_vals = [normalize_cell(df.iat[row_idx, c]) for c in range(df.shape[1])]
+        carry_metric = ""
+        for col_idx, cell in enumerate(row_vals):
+            if col_idx < 4:
+                continue
+            compact_cell = re.sub(r"\s+", "", cell)
+            metric_hit = next((m for m in metric_keywords if m in compact_cell), "")
+            if metric_hit:
+                carry_metric = metric_hit
+            elif not cell and carry_metric:
+                row_vals[col_idx] = carry_metric
+        header_matrix.append(row_vals)
+
     columns: List[str] = []
     for col_idx in range(df.shape[1]):
-        header_fragments = [normalize_cell(df.iat[r, col_idx]) for r in range(min(header_rows, df.shape[0]))]
+        header_fragments = [
+            header_matrix[r][col_idx] if r < len(header_matrix) else normalize_cell(df.iat[r, col_idx])
+            for r in range(min(header_rows, df.shape[0]))
+        ]
         header_text = " ".join(fragment for fragment in header_fragments if fragment)
+        compact_header_text = re.sub(r"\s+", "", header_text)
         if col_idx == 0:
             columns.append("序号")
             continue
@@ -311,8 +335,8 @@ def _rebuild_attach1_column_names(df: pd.DataFrame, header_rows: int) -> List[st
             columns.append("单机容量（万千瓦）")
             continue
 
-        metric = next((m for m in metric_keywords if m in header_text), "")
-        sub = next((s for s in sub_keywords if s in header_text), "")
+        metric = next((m for m in metric_keywords if m in compact_header_text), "")
+        sub = next((s for s in sub_keywords if s in compact_header_text), "")
         if metric and sub:
             columns.append(f"{metric}_{sub}")
         elif metric:
@@ -338,8 +362,39 @@ def postprocess_monthly_attach1_table(df: pd.DataFrame) -> pd.DataFrame:
         normalized.columns = _rebuild_attach1_column_names(normalized, header_rows)
         normalized = normalized.iloc[header_rows:].reset_index(drop=True)
 
-    left_cols = [column for column in ["序号", "名称", "机组编号"] if column in normalized.columns]
+    left_cols = [column for column in ["序号", "名称", "机组编号", "单机容量（万千瓦）"] if column in normalized.columns]
     metric_cols = [column for column in normalized.columns if column not in left_cols]
+    stitch_cols = [column for column in normalized.columns if column not in ["序号", "名称", "机组编号"]]
+    rows_to_drop: set[int] = set()
+    for row_idx in range(normalized.shape[0] - 1):
+        current_left = [normalize_cell(normalized.at[row_idx, c]) for c in left_cols]
+        next_left = [normalize_cell(normalized.at[row_idx + 1, c]) for c in left_cols]
+        current_left_empty = sum(1 for v in current_left if v == "") >= max(1, len(current_left) - 1)
+        next_left_has_id = any(v != "" for v in next_left)
+        if not (current_left_empty and next_left_has_id):
+            continue
+        merged_any = False
+        for stitch_col in stitch_cols:
+            first = normalize_cell(normalized.at[row_idx, stitch_col])
+            second = normalize_cell(normalized.at[row_idx + 1, stitch_col])
+            merged = ""
+            if first.endswith(".") and re.fullmatch(r"\d{1,3}", second):
+                merged = f"{first}{second}"
+            elif first and second == "%" and re.fullmatch(r"\d+(?:\.\d+)?", first):
+                merged = f"{first}%"
+            elif first and not second:
+                merged = first
+            elif not first and second:
+                merged = second
+            if merged:
+                normalized.at[row_idx + 1, stitch_col] = merged
+                merged_any = True
+        if merged_any:
+            rows_to_drop.add(row_idx)
+
+    if rows_to_drop:
+        normalized = normalized.drop(index=sorted(rows_to_drop)).reset_index(drop=True)
+
     for row_idx in range(normalized.shape[0]):
         if "名称" in normalized.columns and "机组编号" in normalized.columns:
             name_value = normalize_cell(normalized.at[row_idx, "名称"])
@@ -347,6 +402,15 @@ def postprocess_monthly_attach1_table(df: pd.DataFrame) -> pd.DataFrame:
             if not name_value and re.search(r"[\u4e00-\u9fff]", unit_value):
                 normalized.at[row_idx, "名称"] = unit_value
                 normalized.at[row_idx, "机组编号"] = ""
+            capacity_col_exists = "单机容量（万千瓦）" in normalized.columns
+            if (
+                capacity_col_exists
+                and name_value
+                and re.fullmatch(r"\d+(?:\.\d+)?", name_value)
+                and not normalize_cell(normalized.at[row_idx, "单机容量（万千瓦）"])
+            ):
+                normalized.at[row_idx, "单机容量（万千瓦）"] = name_value
+                normalized.at[row_idx, "名称"] = ""
         if row_idx > 0 and metric_cols:
             has_metrics = any(normalize_cell(normalized.at[row_idx, column]) for column in metric_cols)
             if has_metrics:
@@ -359,6 +423,9 @@ def postprocess_monthly_attach1_table(df: pd.DataFrame) -> pd.DataFrame:
 def postprocess_tables_for_monthly_report(tables: Sequence[ExtractedTable]) -> List[ExtractedTable]:
     processed: List[ExtractedTable] = []
     for table in tables:
+        if table.engine.startswith("pymupdf_") and (table.title or "") == "附表1":
+            processed.append(table)
+            continue
         processed.append(
             ExtractedTable(
                 df=postprocess_monthly_attach1_table(table.df),
@@ -370,6 +437,126 @@ def postprocess_tables_for_monthly_report(tables: Sequence[ExtractedTable]) -> L
             )
         )
     return processed
+
+
+def _attach1_keyword_hits(df: pd.DataFrame) -> int:
+    if df.empty:
+        return 0
+    header_text = "".join(
+        re.sub(r"\s+", "", normalize_cell(df.iat[r, c]))
+        for r in range(min(5, df.shape[0]))
+        for c in range(df.shape[1])
+    )
+    keywords = ("序号", "名称", "机组编号", "单机容量", "总运行小时", "发电小时", "抽水小时", "本月", "累计")
+    return sum(1 for keyword in keywords if keyword in header_text)
+
+
+def extract_attach1_with_border_grid(input_pdf: Path, verbose: bool = False) -> Optional[ExtractedTable]:
+    try:
+        document = fitz.open(str(input_pdf))
+    except Exception:
+        return None
+
+    best_candidate: Optional[ExtractedTable] = None
+    best_hits = -1
+    try:
+        for page_idx, page in enumerate(document):
+            page_text = page.get_text("text") or ""
+            if "附表1" not in page_text:
+                continue
+
+            for strategy in ("lines_strict", "lines"):
+                try:
+                    finder = page.find_tables(strategy=strategy)
+                except Exception:
+                    continue
+                tables = getattr(finder, "tables", []) or []
+                for table in tables:
+                    row_count = int(getattr(table, "row_count", 0))
+                    col_count = int(getattr(table, "col_count", 0))
+                    if row_count < 8 or col_count < 8:
+                        continue
+
+                    raw_rows = getattr(table, "rows", None) or []
+                    if not raw_rows:
+                        continue
+
+                    grid_values: List[List[str]] = []
+                    raw_cells: List[Dict[str, object]] = []
+                    for row_idx, row_obj in enumerate(raw_rows):
+                        row_cells = getattr(row_obj, "cells", None) or []
+                        row_values: List[str] = []
+                        for col_idx, cell_bbox in enumerate(row_cells):
+                            bbox = _to_bbox(cell_bbox)
+                            if bbox is None:
+                                text = ""
+                            else:
+                                text = page.get_textbox(fitz.Rect(*bbox)) or ""
+                            text = normalize_split_numeric_fragments(normalize_cell(text))
+                            row_values.append(text)
+                            raw_cells.append(
+                                {
+                                    "row_idx": row_idx,
+                                    "col_idx": col_idx,
+                                    "text": text,
+                                    "bbox": bbox,
+                                }
+                            )
+                        grid_values.append(row_values)
+
+                    if not grid_values:
+                        continue
+                    df = pd.DataFrame(grid_values)
+                    hits = _attach1_keyword_hits(df)
+                    if hits < 4:
+                        continue
+
+                    layout_meta = _finalize_layout_meta(raw_cells, df.shape[0], df.shape[1], f"pymupdf_{strategy}")
+                    candidate = ExtractedTable(
+                        df=df.map(lambda value: normalize_split_numeric_fragments(normalize_cell(value))),
+                        page=page_idx + 1,
+                        engine=f"pymupdf_{strategy}",
+                        score=float(hits),
+                        title="附表1",
+                        layout_meta=layout_meta,
+                    )
+                    if hits > best_hits:
+                        best_candidate = candidate
+                        best_hits = hits
+                if best_candidate is not None:
+                    break
+    finally:
+        document.close()
+
+    if best_candidate and verbose:
+        print(
+            f"[{input_pdf.name}] 附表1 border-grid candidate page={best_candidate.page}, engine={best_candidate.engine}, score={best_candidate.score}"
+        )
+    return best_candidate
+
+
+def select_attach1_tables_for_monthly_report(tables: Sequence[ExtractedTable]) -> List[ExtractedTable]:
+    attach1_candidates = [table for table in tables if _looks_like_monthly_attach1_table(table.df)]
+    if attach1_candidates:
+        attach1_candidates = sorted(
+            attach1_candidates,
+            key=lambda table: (table.page, -table.score, -(table.df.shape[0] * table.df.shape[1])),
+        )
+        selected = attach1_candidates[0]
+    elif tables:
+        selected = sorted(tables, key=lambda table: (table.page, -table.score))[0]
+    else:
+        return []
+    return [
+        ExtractedTable(
+            df=selected.df,
+            page=selected.page,
+            engine=selected.engine,
+            score=selected.score,
+            title="附表1",
+            layout_meta=selected.layout_meta,
+        )
+    ]
 
 
 def drop_near_duplicate_columns(df: pd.DataFrame, similarity_threshold: float = 0.95) -> pd.DataFrame:
@@ -1194,14 +1381,17 @@ def write_excel(
     tables: Sequence[ExtractedTable],
     excel_style_mode: str = "basic",
     section_results: Optional[Sequence[SectionExtractionResult]] = None,
+    include_summary_sheet: bool = True,
+    table_sheet_base_name: str = "Table",
+    table_write_header: bool = True,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         summary_rows = []
         for idx, table in enumerate(tables, start=1):
-            sheet_name = f"Table_{idx:03d}"
-            table.df.to_excel(writer, index=False, sheet_name=sheet_name)
+            sheet_name = f"{table_sheet_base_name}_{idx:03d}" if table_sheet_base_name != "附表1" else "附表1"
+            table.df.to_excel(writer, index=False, header=table_write_header, sheet_name=sheet_name)
             merged_regions = infer_merged_regions(table)
             merge_conf_avg = (
                 round(sum(float(m["confidence"]) for m in merged_regions) / len(merged_regions), 4)
@@ -1228,8 +1418,9 @@ def write_excel(
                 }
             )
 
-        summary_df = pd.DataFrame(summary_rows)
-        summary_df.to_excel(writer, index=False, sheet_name="_summary")
+        if include_summary_sheet:
+            summary_df = pd.DataFrame(summary_rows)
+            summary_df.to_excel(writer, index=False, sheet_name="_summary")
 
         workbook = writer.book
         if section_results:
@@ -1280,10 +1471,12 @@ def write_excel(
                             cell.number_format = "yyyy-mm"
 
         for idx, table in enumerate(tables, start=1):
-            sheet = workbook[f"Table_{idx:03d}"]
+            sheet_name = f"{table_sheet_base_name}_{idx:03d}" if table_sheet_base_name != "附表1" else "附表1"
+            sheet = workbook[sheet_name]
+            row_offset = 2 if table_write_header else 1
             for region in infer_merged_regions(table):
-                start_row = int(region["start_row"]) + 2
-                end_row = int(region["end_row"]) + 2
+                start_row = int(region["start_row"]) + row_offset
+                end_row = int(region["end_row"]) + row_offset
                 start_col = int(region["start_col"]) + 1
                 end_col = int(region["end_col"]) + 1
                 if start_row == end_row and start_col == end_col:
@@ -1299,10 +1492,10 @@ def write_excel(
                     anchor.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
         for sheet in workbook.worksheets:
-            for column_cells in sheet.columns:
+            for col_idx, column_cells in enumerate(sheet.columns, start=1):
                 values = [str(cell.value) if cell.value is not None else "" for cell in column_cells]
                 max_len = max((len(v) for v in values), default=10)
-                sheet.column_dimensions[column_cells[0].column_letter].width = min(max(max_len + 2, 10), 40)
+                sheet.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 2, 10), 40)
             sheet.freeze_panes = "A2"
 
 
@@ -1541,7 +1734,15 @@ def main() -> int:
                             f" - title_month_date={title_month_date}, metric={name}, value={value}, unit={unit}, date={report_date}"
                         )
                 return 0
-            extracted = extract_tables_for_pdf(input_pdf, args)
+            monthly_report = is_monthly_report_file(input_pdf)
+            extracted: List[ExtractedTable] = []
+            if monthly_report:
+                attach1_border_table = extract_attach1_with_border_grid(input_pdf, args.verbose)
+                if attach1_border_table is not None:
+                    extracted = [attach1_border_table]
+
+            if not extracted:
+                extracted = extract_tables_for_pdf(input_pdf, args)
             if not extracted:
                 print(
                     (
@@ -1552,8 +1753,9 @@ def main() -> int:
                 )
                 failures += 1
                 continue
-            if is_monthly_report_file(input_pdf):
+            if monthly_report:
                 extracted = postprocess_tables_for_monthly_report(extracted)
+                extracted = select_attach1_tables_for_monthly_report(extracted)
                 section_results = extract_configured_sections_from_pdf(
                     str(input_pdf),
                     default_section_configs(),
@@ -1569,6 +1771,9 @@ def main() -> int:
                 extracted,
                 excel_style_mode=args.excel_style_mode,
                 section_results=section_results,
+                include_summary_sheet=not monthly_report,
+                table_sheet_base_name="附表1" if monthly_report else "Table",
+                table_write_header=not monthly_report,
             )
             print(f"[OK] {input_pdf.name}: saved {len(extracted)} table(s) to {output_path}")
         except Exception as exc:
