@@ -469,6 +469,94 @@ def _table_starts_new_attach_table(df: pd.DataFrame) -> bool:
     return bool(re.search(r"附表[2-9]", head_text))
 
 
+def _table_starts_new_section_title(df: pd.DataFrame) -> bool:
+    if df.empty:
+        return False
+    head_text = "".join(
+        re.sub(r"\s+", "", normalize_cell(df.iat[r, c]))
+        for r in range(min(3, df.shape[0]))
+        for c in range(df.shape[1])
+    )
+    return bool(re.search(r"[（(][一二三四五六七八九十]+[）)]", head_text))
+
+
+def _table_bbox_with_page_size(
+    table: ExtractedTable,
+) -> Tuple[Optional[Tuple[float, float, float, float]], Optional[float], Optional[float]]:
+    if not isinstance(table.layout_meta, dict):
+        return None, None, None
+    bbox = table.layout_meta.get("table_bbox")
+    if not (isinstance(bbox, (list, tuple)) and len(bbox) >= 4):
+        return None, None, None
+    page_height = table.layout_meta.get("page_height")
+    page_width = table.layout_meta.get("page_width")
+    page_height_num = float(page_height) if isinstance(page_height, (int, float)) else None
+    page_width_num = float(page_width) if isinstance(page_width, (int, float)) else None
+    return (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])), page_height_num, page_width_num
+
+
+def _is_data_like_row(row: Sequence[object]) -> bool:
+    values = [normalize_cell(v) for v in row]
+    non_empty = [v for v in values if v]
+    if not non_empty:
+        return False
+    text = "".join(non_empty)
+    if any(marker in text for marker in ("序号", "名称", "机组编号", "单机容量", "本月", "同比", "累计")):
+        return False
+    numeric_hits = sum(bool(re.search(r"\d", v)) for v in non_empty)
+    return numeric_hits >= max(1, len(non_empty) // 2)
+
+
+def detect_attach1_continuation(prev_table: ExtractedTable, next_table: ExtractedTable) -> bool:
+    if next_table.page != prev_table.page + 1:
+        return False
+    if _table_starts_new_attach_table(next_table.df) or _table_starts_new_section_title(next_table.df):
+        return False
+
+    signals = 0
+    if prev_table.df.shape[1] == next_table.df.shape[1]:
+        signals += 2
+    elif abs(prev_table.df.shape[1] - next_table.df.shape[1]) <= 1:
+        signals += 1
+
+    prev_bbox, prev_page_h, prev_page_w = _table_bbox_with_page_size(prev_table)
+    next_bbox, next_page_h, next_page_w = _table_bbox_with_page_size(next_table)
+    if (
+        prev_bbox
+        and next_bbox
+        and prev_page_h
+        and next_page_h
+        and prev_page_w
+        and next_page_w
+        and prev_page_h > 0
+        and next_page_h > 0
+        and prev_page_w > 0
+        and next_page_w > 0
+    ):
+        prev_bottom_ratio = prev_bbox[3] / prev_page_h
+        next_top_ratio = next_bbox[1] / next_page_h
+        if prev_bottom_ratio >= 0.75:
+            signals += 1
+        if next_top_ratio <= 0.25:
+            signals += 1
+        prev_left_ratio = prev_bbox[0] / prev_page_w
+        next_left_ratio = next_bbox[0] / next_page_w
+        width_diff_ratio = abs((prev_bbox[2] - prev_bbox[0]) - (next_bbox[2] - next_bbox[0])) / max(
+            1.0, (prev_bbox[2] - prev_bbox[0])
+        )
+        if abs(prev_left_ratio - next_left_ratio) <= 0.06 and width_diff_ratio <= 0.2:
+            signals += 1
+
+    next_head_rows = min(3, next_table.df.shape[0])
+    if any(_is_data_like_row(next_table.df.iloc[row_idx].tolist()) for row_idx in range(next_head_rows)):
+        signals += 1
+
+    if _attach1_table_title_signal(prev_table) or _attach1_table_title_signal(next_table):
+        signals += 1
+
+    return signals >= 4
+
+
 def _drop_repeated_attach1_headers(base_df: pd.DataFrame, next_df: pd.DataFrame) -> pd.DataFrame:
     if base_df.empty or next_df.empty:
         return next_df
@@ -505,7 +593,25 @@ def _merge_split_row_across_pages(base_df: pd.DataFrame, next_df: pd.DataFrame) 
     first_left_values = [normalize_cell(first_row[col]) for col in left_cols]
     last_left_empty = sum(1 for value in last_left_values if value == "")
     first_left_empty = sum(1 for value in first_left_values if value == "")
-    if last_left_empty == 0 and first_left_empty == 0:
+    last_trailing_empty = 0
+    first_leading_empty = 0
+    for col in reversed(shared_cols):
+        if normalize_cell(last_row[col]) == "":
+            last_trailing_empty += 1
+        else:
+            break
+    for col in shared_cols:
+        if normalize_cell(first_row[col]) == "":
+            first_leading_empty += 1
+        else:
+            break
+
+    looks_like_split_row = (
+        last_left_empty > 0
+        or first_left_empty > 0
+        or (last_trailing_empty >= max(2, len(shared_cols) // 4) and first_leading_empty >= 1)
+    )
+    if not looks_like_split_row:
         return next_df
 
     merged_any = False
@@ -545,20 +651,19 @@ def stitch_attach1_across_pages(tables: Sequence[ExtractedTable]) -> List[Extrac
     stitched_table = attach1_candidates[0]
     stitched_df = stitched_table.df.copy()
     last_page = stitched_table.page
+    previous_table = stitched_table
     for table in attach1_candidates[1:]:
-        if table.page != last_page + 1:
-            break
-        if stitched_df.shape[1] != table.df.shape[1]:
-            break
-        if _table_starts_new_attach_table(table.df):
+        if not detect_attach1_continuation(previous_table, table):
             break
         next_df = _drop_repeated_attach1_headers(stitched_df, table.df.copy())
         next_df = _merge_split_row_across_pages(stitched_df, next_df)
         if next_df.empty:
             last_page = table.page
+            previous_table = table
             continue
         stitched_df = pd.concat([stitched_df, next_df], ignore_index=True)
         last_page = table.page
+        previous_table = table
 
     return [
         ExtractedTable(
@@ -645,6 +750,8 @@ def extract_attach1_with_border_grid(input_pdf: Path, verbose: bool = False) -> 
                         continue
 
                     layout_meta = _finalize_layout_meta(raw_cells, df.shape[0], df.shape[1], f"pymupdf_{strategy}")
+                    layout_meta["page_width"] = float(page.rect.width)
+                    layout_meta["page_height"] = float(page.rect.height)
                     candidate = ExtractedTable(
                         df=df.map(lambda value: normalize_split_numeric_fragments(normalize_cell(value))),
                         page=page_idx + 1,
