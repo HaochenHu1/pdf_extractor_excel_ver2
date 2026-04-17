@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import fitz  #PyMuPDF
+from openpyxl.utils import get_column_letter
 from openpyxl.styles import Alignment
 from paragraph_metric_extractor import (
     SectionExtractionResult,
@@ -422,6 +423,9 @@ def postprocess_monthly_attach1_table(df: pd.DataFrame) -> pd.DataFrame:
 def postprocess_tables_for_monthly_report(tables: Sequence[ExtractedTable]) -> List[ExtractedTable]:
     processed: List[ExtractedTable] = []
     for table in tables:
+        if table.engine.startswith("pymupdf_") and (table.title or "") == "附表1":
+            processed.append(table)
+            continue
         processed.append(
             ExtractedTable(
                 df=postprocess_monthly_attach1_table(table.df),
@@ -433,6 +437,102 @@ def postprocess_tables_for_monthly_report(tables: Sequence[ExtractedTable]) -> L
             )
         )
     return processed
+
+
+def _attach1_keyword_hits(df: pd.DataFrame) -> int:
+    if df.empty:
+        return 0
+    header_text = "".join(
+        re.sub(r"\s+", "", normalize_cell(df.iat[r, c]))
+        for r in range(min(5, df.shape[0]))
+        for c in range(df.shape[1])
+    )
+    keywords = ("序号", "名称", "机组编号", "单机容量", "总运行小时", "发电小时", "抽水小时", "本月", "累计")
+    return sum(1 for keyword in keywords if keyword in header_text)
+
+
+def extract_attach1_with_border_grid(input_pdf: Path, verbose: bool = False) -> Optional[ExtractedTable]:
+    try:
+        document = fitz.open(str(input_pdf))
+    except Exception:
+        return None
+
+    best_candidate: Optional[ExtractedTable] = None
+    best_hits = -1
+    try:
+        for page_idx, page in enumerate(document):
+            page_text = page.get_text("text") or ""
+            if "附表1" not in page_text:
+                continue
+
+            for strategy in ("lines_strict", "lines"):
+                try:
+                    finder = page.find_tables(strategy=strategy)
+                except Exception:
+                    continue
+                tables = getattr(finder, "tables", []) or []
+                for table in tables:
+                    row_count = int(getattr(table, "row_count", 0))
+                    col_count = int(getattr(table, "col_count", 0))
+                    if row_count < 8 or col_count < 8:
+                        continue
+
+                    raw_rows = getattr(table, "rows", None) or []
+                    if not raw_rows:
+                        continue
+
+                    grid_values: List[List[str]] = []
+                    raw_cells: List[Dict[str, object]] = []
+                    for row_idx, row_obj in enumerate(raw_rows):
+                        row_cells = getattr(row_obj, "cells", None) or []
+                        row_values: List[str] = []
+                        for col_idx, cell_bbox in enumerate(row_cells):
+                            bbox = _to_bbox(cell_bbox)
+                            if bbox is None:
+                                text = ""
+                            else:
+                                text = page.get_textbox(fitz.Rect(*bbox)) or ""
+                            text = normalize_split_numeric_fragments(normalize_cell(text))
+                            row_values.append(text)
+                            raw_cells.append(
+                                {
+                                    "row_idx": row_idx,
+                                    "col_idx": col_idx,
+                                    "text": text,
+                                    "bbox": bbox,
+                                }
+                            )
+                        grid_values.append(row_values)
+
+                    if not grid_values:
+                        continue
+                    df = pd.DataFrame(grid_values)
+                    hits = _attach1_keyword_hits(df)
+                    if hits < 4:
+                        continue
+
+                    layout_meta = _finalize_layout_meta(raw_cells, df.shape[0], df.shape[1], f"pymupdf_{strategy}")
+                    candidate = ExtractedTable(
+                        df=df.map(lambda value: normalize_split_numeric_fragments(normalize_cell(value))),
+                        page=page_idx + 1,
+                        engine=f"pymupdf_{strategy}",
+                        score=float(hits),
+                        title="附表1",
+                        layout_meta=layout_meta,
+                    )
+                    if hits > best_hits:
+                        best_candidate = candidate
+                        best_hits = hits
+                if best_candidate is not None:
+                    break
+    finally:
+        document.close()
+
+    if best_candidate and verbose:
+        print(
+            f"[{input_pdf.name}] 附表1 border-grid candidate page={best_candidate.page}, engine={best_candidate.engine}, score={best_candidate.score}"
+        )
+    return best_candidate
 
 
 def select_attach1_tables_for_monthly_report(tables: Sequence[ExtractedTable]) -> List[ExtractedTable]:
@@ -1283,6 +1383,7 @@ def write_excel(
     section_results: Optional[Sequence[SectionExtractionResult]] = None,
     include_summary_sheet: bool = True,
     table_sheet_base_name: str = "Table",
+    table_write_header: bool = True,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1290,7 +1391,7 @@ def write_excel(
         summary_rows = []
         for idx, table in enumerate(tables, start=1):
             sheet_name = f"{table_sheet_base_name}_{idx:03d}" if table_sheet_base_name != "附表1" else "附表1"
-            table.df.to_excel(writer, index=False, sheet_name=sheet_name)
+            table.df.to_excel(writer, index=False, header=table_write_header, sheet_name=sheet_name)
             merged_regions = infer_merged_regions(table)
             merge_conf_avg = (
                 round(sum(float(m["confidence"]) for m in merged_regions) / len(merged_regions), 4)
@@ -1372,9 +1473,10 @@ def write_excel(
         for idx, table in enumerate(tables, start=1):
             sheet_name = f"{table_sheet_base_name}_{idx:03d}" if table_sheet_base_name != "附表1" else "附表1"
             sheet = workbook[sheet_name]
+            row_offset = 2 if table_write_header else 1
             for region in infer_merged_regions(table):
-                start_row = int(region["start_row"]) + 2
-                end_row = int(region["end_row"]) + 2
+                start_row = int(region["start_row"]) + row_offset
+                end_row = int(region["end_row"]) + row_offset
                 start_col = int(region["start_col"]) + 1
                 end_col = int(region["end_col"]) + 1
                 if start_row == end_row and start_col == end_col:
@@ -1390,10 +1492,10 @@ def write_excel(
                     anchor.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
         for sheet in workbook.worksheets:
-            for column_cells in sheet.columns:
+            for col_idx, column_cells in enumerate(sheet.columns, start=1):
                 values = [str(cell.value) if cell.value is not None else "" for cell in column_cells]
                 max_len = max((len(v) for v in values), default=10)
-                sheet.column_dimensions[column_cells[0].column_letter].width = min(max(max_len + 2, 10), 40)
+                sheet.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 2, 10), 40)
             sheet.freeze_panes = "A2"
 
 
@@ -1632,7 +1734,15 @@ def main() -> int:
                             f" - title_month_date={title_month_date}, metric={name}, value={value}, unit={unit}, date={report_date}"
                         )
                 return 0
-            extracted = extract_tables_for_pdf(input_pdf, args)
+            monthly_report = is_monthly_report_file(input_pdf)
+            extracted: List[ExtractedTable] = []
+            if monthly_report:
+                attach1_border_table = extract_attach1_with_border_grid(input_pdf, args.verbose)
+                if attach1_border_table is not None:
+                    extracted = [attach1_border_table]
+
+            if not extracted:
+                extracted = extract_tables_for_pdf(input_pdf, args)
             if not extracted:
                 print(
                     (
@@ -1643,7 +1753,7 @@ def main() -> int:
                 )
                 failures += 1
                 continue
-            if is_monthly_report_file(input_pdf):
+            if monthly_report:
                 extracted = postprocess_tables_for_monthly_report(extracted)
                 extracted = select_attach1_tables_for_monthly_report(extracted)
                 section_results = extract_configured_sections_from_pdf(
@@ -1661,8 +1771,9 @@ def main() -> int:
                 extracted,
                 excel_style_mode=args.excel_style_mode,
                 section_results=section_results,
-                include_summary_sheet=not is_monthly_report_file(input_pdf),
-                table_sheet_base_name="附表1" if is_monthly_report_file(input_pdf) else "Table",
+                include_summary_sheet=not monthly_report,
+                table_sheet_base_name="附表1" if monthly_report else "Table",
+                table_write_header=not monthly_report,
             )
             print(f"[OK] {input_pdf.name}: saved {len(extracted)} table(s) to {output_path}")
         except Exception as exc:
