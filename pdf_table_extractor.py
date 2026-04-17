@@ -224,6 +224,15 @@ def normalize_cell(value: object) -> str:
         return ""
     return text
 
+
+def normalize_split_numeric_fragments(text: str) -> str:
+    normalized = text
+    normalized = re.sub(r"(\d+\.)\s+(\d{1,3})\b", r"\1\2", normalized)
+    normalized = re.sub(r"(\d+\.\d)\s+(\d)\b", r"\1\2", normalized)
+    normalized = re.sub(r"(\d)\s+(\d{3}(?:\.\d+)?)\b", r"\1\2", normalized)
+    normalized = re.sub(r"(\d),\s+(\d{3}\b)", r"\1,\2", normalized)
+    return normalized.strip()
+
 #Creates a copy of the original table using `copy()`; 
 #Then cleanses every individual cell using `cleaned.map(normalize_cell)`
 #Removes any rows and columns that are entirely empty using apply(..., axis=1)`,
@@ -249,6 +258,118 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     cleaned = cleaned.reset_index(drop=True)
     cleaned.columns = [f"col_{i+1}" for i in range(cleaned.shape[1])]
     return cleaned
+
+
+def _looks_like_monthly_attach1_table(df: pd.DataFrame) -> bool:
+    if df.empty:
+        return False
+    header_zone = " ".join(
+        normalize_cell(df.iat[r, c]) for r in range(min(6, df.shape[0])) for c in range(df.shape[1])
+    )
+    keywords = ("附表1", "序号", "机组编号", "单机容量", "总运行小时", "发电小时")
+    return sum(1 for keyword in keywords if keyword in header_zone) >= 3
+
+
+def _extract_attach1_header_rows(df: pd.DataFrame, max_header_rows: int = 5) -> int:
+    header_rows = 0
+    for row_idx in range(min(max_header_rows, df.shape[0])):
+        row_values = [normalize_cell(v) for v in df.iloc[row_idx].tolist()]
+        row_text = " ".join(v for v in row_values if v)
+        if not row_text:
+            continue
+        non_empty_count = len([v for v in row_values if v])
+        numeric_cells = sum(bool(re.fullmatch(r"[-+]?\d+(?:\.\d+)?%?", v)) for v in row_values if v)
+        marker_hit = sum(
+            1
+            for marker in ("序号", "名称", "机组编号", "单机容量", "本月", "同比", "累计", "小时", "次数", "成功率")
+            if marker in row_text
+        )
+        if marker_hit >= 1 and numeric_cells <= max(1, non_empty_count // 2):
+            header_rows = row_idx + 1
+        else:
+            break
+    return max(header_rows, 1)
+
+
+def _rebuild_attach1_column_names(df: pd.DataFrame, header_rows: int) -> List[str]:
+    metric_keywords = ["总运行小时", "发电小时", "抽水小时", "发电调相", "抽水调相", "等效可用系数", "启停次数", "启停成功率", "等效强迫停运率"]
+    sub_keywords = ["本月", "同比", "累计"]
+    columns: List[str] = []
+    for col_idx in range(df.shape[1]):
+        header_fragments = [normalize_cell(df.iat[r, col_idx]) for r in range(min(header_rows, df.shape[0]))]
+        header_text = " ".join(fragment for fragment in header_fragments if fragment)
+        if col_idx == 0:
+            columns.append("序号")
+            continue
+        if col_idx == 1:
+            columns.append("名称")
+            continue
+        if col_idx == 2:
+            columns.append("机组编号")
+            continue
+        if col_idx == 3:
+            columns.append("单机容量（万千瓦）")
+            continue
+
+        metric = next((m for m in metric_keywords if m in header_text), "")
+        sub = next((s for s in sub_keywords if s in header_text), "")
+        if metric and sub:
+            columns.append(f"{metric}_{sub}")
+        elif metric:
+            columns.append(metric)
+        elif sub:
+            columns.append(f"指标_{sub}")
+        elif header_text:
+            columns.append(header_text)
+        else:
+            columns.append(f"指标_{col_idx+1}")
+    return columns
+
+
+def postprocess_monthly_attach1_table(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    normalized = df.copy().map(lambda value: normalize_split_numeric_fragments(normalize_cell(value)))
+    if not _looks_like_monthly_attach1_table(normalized):
+        return normalized
+
+    header_rows = _extract_attach1_header_rows(normalized)
+    if header_rows > 0 and normalized.shape[0] > header_rows:
+        normalized.columns = _rebuild_attach1_column_names(normalized, header_rows)
+        normalized = normalized.iloc[header_rows:].reset_index(drop=True)
+
+    left_cols = [column for column in ["序号", "名称", "机组编号"] if column in normalized.columns]
+    metric_cols = [column for column in normalized.columns if column not in left_cols]
+    for row_idx in range(normalized.shape[0]):
+        if "名称" in normalized.columns and "机组编号" in normalized.columns:
+            name_value = normalize_cell(normalized.at[row_idx, "名称"])
+            unit_value = normalize_cell(normalized.at[row_idx, "机组编号"])
+            if not name_value and re.search(r"[\u4e00-\u9fff]", unit_value):
+                normalized.at[row_idx, "名称"] = unit_value
+                normalized.at[row_idx, "机组编号"] = ""
+        if row_idx > 0 and metric_cols:
+            has_metrics = any(normalize_cell(normalized.at[row_idx, column]) for column in metric_cols)
+            if has_metrics:
+                for left_col in left_cols:
+                    if normalize_cell(normalized.at[row_idx, left_col]) == "":
+                        normalized.at[row_idx, left_col] = normalize_cell(normalized.at[row_idx - 1, left_col])
+    return normalized
+
+
+def postprocess_tables_for_monthly_report(tables: Sequence[ExtractedTable]) -> List[ExtractedTable]:
+    processed: List[ExtractedTable] = []
+    for table in tables:
+        processed.append(
+            ExtractedTable(
+                df=postprocess_monthly_attach1_table(table.df),
+                page=table.page,
+                engine=table.engine,
+                score=table.score,
+                title=table.title,
+                layout_meta=table.layout_meta,
+            )
+        )
+    return processed
 
 
 def drop_near_duplicate_columns(df: pd.DataFrame, similarity_threshold: float = 0.95) -> pd.DataFrame:
@@ -1380,6 +1501,10 @@ def build_output_path(args: argparse.Namespace, input_pdf: Path, batch_mode: boo
     return input_pdf.with_name(f"{input_pdf.stem}_tables.xlsx")
 
 
+def is_monthly_report_file(input_pdf: Path) -> bool:
+    return "广东电力现货市场结算运行情况月报" in input_pdf.name
+
+
 def main() -> int:
     args = parse_args()
 
@@ -1427,10 +1552,17 @@ def main() -> int:
                 )
                 failures += 1
                 continue
-            section_results = extract_configured_sections_from_pdf(
-                str(input_pdf),
-                default_section_configs(),
-            )
+            if is_monthly_report_file(input_pdf):
+                extracted = postprocess_tables_for_monthly_report(extracted)
+                section_results = extract_configured_sections_from_pdf(
+                    str(input_pdf),
+                    default_section_configs(),
+                )
+            else:
+                section_results = extract_configured_sections_from_pdf(
+                    str(input_pdf),
+                    default_section_configs(),
+                )
             output_path = build_output_path(args, input_pdf, batch_mode)
             write_excel(
                 output_path,
