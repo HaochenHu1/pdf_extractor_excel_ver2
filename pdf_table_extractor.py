@@ -19,6 +19,28 @@ from paragraph_metric_extractor import (
     extract_configured_sections_from_pdf,
 )
 
+MONTHLY_REPORT_FILENAME_KEYWORD = "广东电力现货市场结算运行情况月报"
+MONTHLY_TARGET_TABLE_KEYWORDS: Tuple[str, ...] = (
+    "附表1",
+    "（二）日前市场情况",
+    "（三）实时市场情况",
+    "日前市场情况",
+    "实时市场情况",
+)
+
+ATTACHMENT1_PARENT_HEADERS: Tuple[str, ...] = (
+    "总运行小时",
+    "发电小时",
+    "抽水小时",
+    "发电调相",
+    "抽水调相",
+    "等效可用系数",
+    "启停次数",
+    "启停成功率",
+    "等效强迫停运率",
+)
+ATTACHMENT1_SUB_HEADERS: Tuple[str, ...] = ("本月", "同比", "累计")
+
 @dataclass
 class ExtractedTable:
     df: pd.DataFrame
@@ -249,6 +271,85 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     cleaned = cleaned.reset_index(drop=True)
     cleaned.columns = [f"col_{i+1}" for i in range(cleaned.shape[1])]
     return cleaned
+
+
+def _normalize_decimal_fragment(text: str) -> str:
+    if not text:
+        return text
+    normalized = text
+    for _ in range(2):
+        normalized = re.sub(r"(?<!\d)(\d+)\.\s+(\d{1,3})(?!\d)", r"\1.\2", normalized)
+    return normalized
+
+
+def _is_attachment1_table(df: pd.DataFrame, page_text: str) -> bool:
+    lowered_page_text = normalize_cell(page_text)
+    if "附表1" in lowered_page_text:
+        return True
+    if df.empty:
+        return False
+    header_zone = " ".join(
+        normalize_cell(df.iat[row_idx, col_idx])
+        for row_idx in range(min(3, df.shape[0]))
+        for col_idx in range(df.shape[1])
+    )
+    return any(token in header_zone for token in ATTACHMENT1_PARENT_HEADERS)
+
+
+def _reconstruct_attachment1_headers(df: pd.DataFrame) -> pd.DataFrame:
+    if df.shape[0] < 2:
+        return df
+    row0 = [normalize_cell(v) for v in df.iloc[0].tolist()]
+    row1 = [normalize_cell(v) for v in df.iloc[1].tolist()]
+    if sum(1 for cell in row1 if cell in ATTACHMENT1_SUB_HEADERS) < 3:
+        return df
+
+    parent = ""
+    combined_headers: List[str] = []
+    left_id_markers = ("序号", "名称", "机组编号", "单机容量")
+    for col_idx in range(df.shape[1]):
+        cell0 = row0[col_idx]
+        cell1 = row1[col_idx]
+        if cell0:
+            parent = cell0
+        is_left_identifier = any(marker in (cell0 + cell1) for marker in left_id_markers)
+        if is_left_identifier:
+            merged = normalize_cell(f"{cell0}{cell1}")
+            merged = merged.replace("（ ", "（").replace(" ）", "）")
+            combined_headers.append(merged or cell0 or cell1)
+            continue
+        if cell1 in ATTACHMENT1_SUB_HEADERS and parent:
+            combined_headers.append(f"{parent}_{cell1}")
+        else:
+            combined_headers.append(cell0 or cell1)
+
+    rebuilt = df.copy().reset_index(drop=True)
+    rebuilt.iloc[0] = combined_headers
+    rebuilt = rebuilt.drop(index=1).reset_index(drop=True)
+    return rebuilt
+
+
+def _clean_attachment1_cell_text(text: str) -> str:
+    value = _normalize_decimal_fragment(normalize_cell(text))
+    value = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff#])", "", value)
+    value = re.sub(r"(?<=#)\s+(?=\d)", "", value)
+    return value
+
+
+def postprocess_attachment1_table(table: ExtractedTable, page_text: str) -> ExtractedTable:
+    if not _is_attachment1_table(table.df, page_text):
+        return table
+
+    cleaned = table.df.copy().map(_clean_attachment1_cell_text)
+    cleaned = _reconstruct_attachment1_headers(cleaned)
+    return ExtractedTable(
+        df=cleaned,
+        page=table.page,
+        engine=table.engine,
+        score=table.score,
+        title=table.title,
+        layout_meta=table.layout_meta,
+    )
 
 
 def drop_near_duplicate_columns(df: pd.DataFrame, similarity_threshold: float = 0.95) -> pd.DataFrame:
@@ -1380,6 +1481,32 @@ def build_output_path(args: argparse.Namespace, input_pdf: Path, batch_mode: boo
     return input_pdf.with_name(f"{input_pdf.stem}_tables.xlsx")
 
 
+def is_monthly_report_pdf(input_pdf: Path) -> bool:
+    return MONTHLY_REPORT_FILENAME_KEYWORD in input_pdf.name
+
+
+def collect_pdf_page_texts(input_pdf: Path) -> Dict[int, str]:
+    doc = fitz.open(str(input_pdf))
+    page_texts: Dict[int, str] = {}
+    for idx, page in enumerate(doc, start=1):
+        page_texts[idx] = page.get_text("text") or ""
+    doc.close()
+    return page_texts
+
+
+def filter_monthly_target_tables(
+    tables: Sequence[ExtractedTable],
+    page_texts: Dict[int, str],
+) -> List[ExtractedTable]:
+    filtered: List[ExtractedTable] = []
+    for table in tables:
+        page_text = normalize_cell(page_texts.get(table.page, ""))
+        keep = any(keyword in page_text for keyword in MONTHLY_TARGET_TABLE_KEYWORDS)
+        if keep:
+            filtered.append(postprocess_attachment1_table(table, page_text))
+    return filtered
+
+
 def main() -> int:
     args = parse_args()
 
@@ -1417,6 +1544,10 @@ def main() -> int:
                         )
                 return 0
             extracted = extract_tables_for_pdf(input_pdf, args)
+            monthly_mode = is_monthly_report_pdf(input_pdf)
+            if monthly_mode:
+                page_texts = collect_pdf_page_texts(input_pdf)
+                extracted = filter_monthly_target_tables(extracted, page_texts)
             if not extracted:
                 print(
                     (
@@ -1427,10 +1558,12 @@ def main() -> int:
                 )
                 failures += 1
                 continue
-            section_results = extract_configured_sections_from_pdf(
-                str(input_pdf),
-                default_section_configs(),
-            )
+            section_results: Optional[List[SectionExtractionResult]] = None
+            if not monthly_mode:
+                section_results = extract_configured_sections_from_pdf(
+                    str(input_pdf),
+                    default_section_configs(),
+                )
             output_path = build_output_path(args, input_pdf, batch_mode)
             write_excel(
                 output_path,
