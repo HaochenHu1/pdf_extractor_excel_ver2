@@ -507,6 +507,22 @@ def _is_data_like_row(row: Sequence[object]) -> bool:
     return numeric_hits >= max(1, len(non_empty) // 2)
 
 
+def _extract_serial_numbers(df: pd.DataFrame) -> List[int]:
+    if df.empty or df.shape[1] == 0:
+        return []
+    serials: List[int] = []
+    for row_idx in range(df.shape[0]):
+        raw = normalize_cell(df.iat[row_idx, 0])
+        match = re.search(r"\d{1,4}", raw)
+        if not match:
+            continue
+        try:
+            serials.append(int(match.group(0)))
+        except ValueError:
+            continue
+    return serials
+
+
 def detect_attach1_continuation(prev_table: ExtractedTable, next_table: ExtractedTable) -> bool:
     if next_table.page != prev_table.page + 1:
         return False
@@ -554,7 +570,13 @@ def detect_attach1_continuation(prev_table: ExtractedTable, next_table: Extracte
     if _attach1_table_title_signal(prev_table) or _attach1_table_title_signal(next_table):
         signals += 1
 
-    return signals >= 4
+    prev_serials = _extract_serial_numbers(prev_table.df)
+    next_serials = _extract_serial_numbers(next_table.df)
+    if prev_serials and next_serials:
+        if max(next_serials) >= max(prev_serials) and min(next_serials) <= max(prev_serials) + 3:
+            signals += 1
+
+    return signals >= 3
 
 
 def _drop_repeated_attach1_headers(base_df: pd.DataFrame, next_df: pd.DataFrame) -> pd.DataFrame:
@@ -642,17 +664,19 @@ def stitch_attach1_across_pages(tables: Sequence[ExtractedTable]) -> List[Extrac
     if not tables:
         return []
     sorted_tables = sorted(tables, key=lambda table: (table.page, -table.score))
-    attach1_candidates = [table for table in sorted_tables if _attach1_table_title_signal(table)]
-    if not attach1_candidates:
-        attach1_candidates = sorted_tables[:1]
-    if not attach1_candidates:
+    first_attach1_idx = next((idx for idx, table in enumerate(sorted_tables) if _attach1_table_title_signal(table)), 0)
+    if first_attach1_idx >= len(sorted_tables):
         return []
 
-    stitched_table = attach1_candidates[0]
+    stitched_table = sorted_tables[first_attach1_idx]
     stitched_df = stitched_table.df.copy()
     last_page = stitched_table.page
     previous_table = stitched_table
-    for table in attach1_candidates[1:]:
+    for table in sorted_tables[first_attach1_idx + 1 :]:
+        if table.page < last_page:
+            continue
+        if table.page > last_page + 1:
+            break
         if not detect_attach1_continuation(previous_table, table):
             break
         next_df = _drop_repeated_attach1_headers(stitched_df, table.df.copy())
