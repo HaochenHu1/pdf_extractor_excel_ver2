@@ -227,8 +227,10 @@ def normalize_cell(value: object) -> str:
 
 def normalize_split_numeric_fragments(text: str) -> str:
     normalized = text
+    normalized = re.sub(r"(?<!\d)(\d+)\s*\.\s+(\d{1,3})(?!\d)", r"\1.\2", normalized)
     normalized = re.sub(r"(\d+\.)\s+(\d{1,3})\b", r"\1\2", normalized)
     normalized = re.sub(r"(\d+\.\d)\s+(\d)\b", r"\1\2", normalized)
+    normalized = re.sub(r"(\d+\.\d{2})\s+([%‰])\b", r"\1\2", normalized)
     normalized = re.sub(r"(\d)\s+(\d{3}(?:\.\d+)?)\b", r"\1\2", normalized)
     normalized = re.sub(r"(\d),\s+(\d{3}\b)", r"\1,\2", normalized)
     return normalized.strip()
@@ -266,8 +268,9 @@ def _looks_like_monthly_attach1_table(df: pd.DataFrame) -> bool:
     header_zone = " ".join(
         normalize_cell(df.iat[r, c]) for r in range(min(6, df.shape[0])) for c in range(df.shape[1])
     )
+    compact_zone = re.sub(r"\s+", "", header_zone)
     keywords = ("附表1", "序号", "机组编号", "单机容量", "总运行小时", "发电小时")
-    return sum(1 for keyword in keywords if keyword in header_zone) >= 3
+    return sum(1 for keyword in keywords if keyword in compact_zone) >= 2
 
 
 def _extract_attach1_header_rows(df: pd.DataFrame, max_header_rows: int = 5) -> int:
@@ -275,6 +278,7 @@ def _extract_attach1_header_rows(df: pd.DataFrame, max_header_rows: int = 5) -> 
     for row_idx in range(min(max_header_rows, df.shape[0])):
         row_values = [normalize_cell(v) for v in df.iloc[row_idx].tolist()]
         row_text = " ".join(v for v in row_values if v)
+        compact_row_text = re.sub(r"\s+", "", row_text)
         if not row_text:
             continue
         non_empty_count = len([v for v in row_values if v])
@@ -282,7 +286,7 @@ def _extract_attach1_header_rows(df: pd.DataFrame, max_header_rows: int = 5) -> 
         marker_hit = sum(
             1
             for marker in ("序号", "名称", "机组编号", "单机容量", "本月", "同比", "累计", "小时", "次数", "成功率")
-            if marker in row_text
+            if marker in compact_row_text
         )
         if marker_hit >= 1 and numeric_cells <= max(1, non_empty_count // 2):
             header_rows = row_idx + 1
@@ -294,10 +298,29 @@ def _extract_attach1_header_rows(df: pd.DataFrame, max_header_rows: int = 5) -> 
 def _rebuild_attach1_column_names(df: pd.DataFrame, header_rows: int) -> List[str]:
     metric_keywords = ["总运行小时", "发电小时", "抽水小时", "发电调相", "抽水调相", "等效可用系数", "启停次数", "启停成功率", "等效强迫停运率"]
     sub_keywords = ["本月", "同比", "累计"]
+    header_matrix: List[List[str]] = []
+    for row_idx in range(min(header_rows, df.shape[0])):
+        row_vals = [normalize_cell(df.iat[row_idx, c]) for c in range(df.shape[1])]
+        carry_metric = ""
+        for col_idx, cell in enumerate(row_vals):
+            if col_idx < 4:
+                continue
+            compact_cell = re.sub(r"\s+", "", cell)
+            metric_hit = next((m for m in metric_keywords if m in compact_cell), "")
+            if metric_hit:
+                carry_metric = metric_hit
+            elif not cell and carry_metric:
+                row_vals[col_idx] = carry_metric
+        header_matrix.append(row_vals)
+
     columns: List[str] = []
     for col_idx in range(df.shape[1]):
-        header_fragments = [normalize_cell(df.iat[r, col_idx]) for r in range(min(header_rows, df.shape[0]))]
+        header_fragments = [
+            header_matrix[r][col_idx] if r < len(header_matrix) else normalize_cell(df.iat[r, col_idx])
+            for r in range(min(header_rows, df.shape[0]))
+        ]
         header_text = " ".join(fragment for fragment in header_fragments if fragment)
+        compact_header_text = re.sub(r"\s+", "", header_text)
         if col_idx == 0:
             columns.append("序号")
             continue
@@ -311,8 +334,8 @@ def _rebuild_attach1_column_names(df: pd.DataFrame, header_rows: int) -> List[st
             columns.append("单机容量（万千瓦）")
             continue
 
-        metric = next((m for m in metric_keywords if m in header_text), "")
-        sub = next((s for s in sub_keywords if s in header_text), "")
+        metric = next((m for m in metric_keywords if m in compact_header_text), "")
+        sub = next((s for s in sub_keywords if s in compact_header_text), "")
         if metric and sub:
             columns.append(f"{metric}_{sub}")
         elif metric:
@@ -338,8 +361,39 @@ def postprocess_monthly_attach1_table(df: pd.DataFrame) -> pd.DataFrame:
         normalized.columns = _rebuild_attach1_column_names(normalized, header_rows)
         normalized = normalized.iloc[header_rows:].reset_index(drop=True)
 
-    left_cols = [column for column in ["序号", "名称", "机组编号"] if column in normalized.columns]
+    left_cols = [column for column in ["序号", "名称", "机组编号", "单机容量（万千瓦）"] if column in normalized.columns]
     metric_cols = [column for column in normalized.columns if column not in left_cols]
+    stitch_cols = [column for column in normalized.columns if column not in ["序号", "名称", "机组编号"]]
+    rows_to_drop: set[int] = set()
+    for row_idx in range(normalized.shape[0] - 1):
+        current_left = [normalize_cell(normalized.at[row_idx, c]) for c in left_cols]
+        next_left = [normalize_cell(normalized.at[row_idx + 1, c]) for c in left_cols]
+        current_left_empty = sum(1 for v in current_left if v == "") >= max(1, len(current_left) - 1)
+        next_left_has_id = any(v != "" for v in next_left)
+        if not (current_left_empty and next_left_has_id):
+            continue
+        merged_any = False
+        for stitch_col in stitch_cols:
+            first = normalize_cell(normalized.at[row_idx, stitch_col])
+            second = normalize_cell(normalized.at[row_idx + 1, stitch_col])
+            merged = ""
+            if first.endswith(".") and re.fullmatch(r"\d{1,3}", second):
+                merged = f"{first}{second}"
+            elif first and second == "%" and re.fullmatch(r"\d+(?:\.\d+)?", first):
+                merged = f"{first}%"
+            elif first and not second:
+                merged = first
+            elif not first and second:
+                merged = second
+            if merged:
+                normalized.at[row_idx + 1, stitch_col] = merged
+                merged_any = True
+        if merged_any:
+            rows_to_drop.add(row_idx)
+
+    if rows_to_drop:
+        normalized = normalized.drop(index=sorted(rows_to_drop)).reset_index(drop=True)
+
     for row_idx in range(normalized.shape[0]):
         if "名称" in normalized.columns and "机组编号" in normalized.columns:
             name_value = normalize_cell(normalized.at[row_idx, "名称"])
@@ -347,6 +401,15 @@ def postprocess_monthly_attach1_table(df: pd.DataFrame) -> pd.DataFrame:
             if not name_value and re.search(r"[\u4e00-\u9fff]", unit_value):
                 normalized.at[row_idx, "名称"] = unit_value
                 normalized.at[row_idx, "机组编号"] = ""
+            capacity_col_exists = "单机容量（万千瓦）" in normalized.columns
+            if (
+                capacity_col_exists
+                and name_value
+                and re.fullmatch(r"\d+(?:\.\d+)?", name_value)
+                and not normalize_cell(normalized.at[row_idx, "单机容量（万千瓦）"])
+            ):
+                normalized.at[row_idx, "单机容量（万千瓦）"] = name_value
+                normalized.at[row_idx, "名称"] = ""
         if row_idx > 0 and metric_cols:
             has_metrics = any(normalize_cell(normalized.at[row_idx, column]) for column in metric_cols)
             if has_metrics:
@@ -370,6 +433,30 @@ def postprocess_tables_for_monthly_report(tables: Sequence[ExtractedTable]) -> L
             )
         )
     return processed
+
+
+def select_attach1_tables_for_monthly_report(tables: Sequence[ExtractedTable]) -> List[ExtractedTable]:
+    attach1_candidates = [table for table in tables if _looks_like_monthly_attach1_table(table.df)]
+    if attach1_candidates:
+        attach1_candidates = sorted(
+            attach1_candidates,
+            key=lambda table: (table.page, -table.score, -(table.df.shape[0] * table.df.shape[1])),
+        )
+        selected = attach1_candidates[0]
+    elif tables:
+        selected = sorted(tables, key=lambda table: (table.page, -table.score))[0]
+    else:
+        return []
+    return [
+        ExtractedTable(
+            df=selected.df,
+            page=selected.page,
+            engine=selected.engine,
+            score=selected.score,
+            title="附表1",
+            layout_meta=selected.layout_meta,
+        )
+    ]
 
 
 def drop_near_duplicate_columns(df: pd.DataFrame, similarity_threshold: float = 0.95) -> pd.DataFrame:
@@ -1194,13 +1281,15 @@ def write_excel(
     tables: Sequence[ExtractedTable],
     excel_style_mode: str = "basic",
     section_results: Optional[Sequence[SectionExtractionResult]] = None,
+    include_summary_sheet: bool = True,
+    table_sheet_base_name: str = "Table",
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         summary_rows = []
         for idx, table in enumerate(tables, start=1):
-            sheet_name = f"Table_{idx:03d}"
+            sheet_name = f"{table_sheet_base_name}_{idx:03d}" if table_sheet_base_name != "附表1" else "附表1"
             table.df.to_excel(writer, index=False, sheet_name=sheet_name)
             merged_regions = infer_merged_regions(table)
             merge_conf_avg = (
@@ -1228,8 +1317,9 @@ def write_excel(
                 }
             )
 
-        summary_df = pd.DataFrame(summary_rows)
-        summary_df.to_excel(writer, index=False, sheet_name="_summary")
+        if include_summary_sheet:
+            summary_df = pd.DataFrame(summary_rows)
+            summary_df.to_excel(writer, index=False, sheet_name="_summary")
 
         workbook = writer.book
         if section_results:
@@ -1280,7 +1370,8 @@ def write_excel(
                             cell.number_format = "yyyy-mm"
 
         for idx, table in enumerate(tables, start=1):
-            sheet = workbook[f"Table_{idx:03d}"]
+            sheet_name = f"{table_sheet_base_name}_{idx:03d}" if table_sheet_base_name != "附表1" else "附表1"
+            sheet = workbook[sheet_name]
             for region in infer_merged_regions(table):
                 start_row = int(region["start_row"]) + 2
                 end_row = int(region["end_row"]) + 2
@@ -1554,6 +1645,7 @@ def main() -> int:
                 continue
             if is_monthly_report_file(input_pdf):
                 extracted = postprocess_tables_for_monthly_report(extracted)
+                extracted = select_attach1_tables_for_monthly_report(extracted)
                 section_results = extract_configured_sections_from_pdf(
                     str(input_pdf),
                     default_section_configs(),
@@ -1569,6 +1661,8 @@ def main() -> int:
                 extracted,
                 excel_style_mode=args.excel_style_mode,
                 section_results=section_results,
+                include_summary_sheet=not is_monthly_report_file(input_pdf),
+                table_sheet_base_name="附表1" if is_monthly_report_file(input_pdf) else "Table",
             )
             print(f"[OK] {input_pdf.name}: saved {len(extracted)} table(s) to {output_path}")
         except Exception as exc:
