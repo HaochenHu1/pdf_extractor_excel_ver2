@@ -575,13 +575,24 @@ def _extract_serial_numbers(df: pd.DataFrame) -> List[int]:
     return serials
 
 
-def detect_attach1_continuation(prev_table: ExtractedTable, next_table: ExtractedTable) -> bool:
+def _attach1_continuation_diagnostics(
+    prev_table: ExtractedTable, next_table: ExtractedTable
+) -> Tuple[bool, Dict[str, Any]]:
+    details: Dict[str, Any] = {
+        "prev_page": prev_table.page,
+        "next_page": next_table.page,
+        "signals": 0,
+    }
     if next_table.page != prev_table.page + 1:
-        return False
+        details["reason"] = "not_adjacent_pages"
+        return False, details
     if _table_starts_new_attach_table(next_table.df) or _table_starts_new_section_title(next_table.df):
-        return False
+        details["reason"] = "new_table_or_section_title"
+        return False, details
 
     signals = 0
+    details["col_count_prev"] = prev_table.df.shape[1]
+    details["col_count_next"] = next_table.df.shape[1]
     if prev_table.df.shape[1] == next_table.df.shape[1]:
         signals += 2
     elif abs(prev_table.df.shape[1] - next_table.df.shape[1]) <= 1:
@@ -631,12 +642,20 @@ def detect_attach1_continuation(prev_table: ExtractedTable, next_table: Extracte
     prev_boundaries = _column_boundary_signature(prev_table.layout_meta)
     next_boundaries = _column_boundary_signature(next_table.layout_meta)
     boundary_similarity = _column_boundary_similarity(prev_boundaries, next_boundaries)
+    details["boundary_similarity"] = round(boundary_similarity, 4)
     if boundary_similarity >= 0.78:
         signals += 2
     elif boundary_similarity >= 0.66:
         signals += 1
 
-    return signals >= 3
+    details["signals"] = signals
+    details["reason"] = "passed" if signals >= 3 else "insufficient_signals"
+    return signals >= 3, details
+
+
+def detect_attach1_continuation(prev_table: ExtractedTable, next_table: ExtractedTable) -> bool:
+    ok, _ = _attach1_continuation_diagnostics(prev_table, next_table)
+    return ok
 
 
 def _drop_repeated_attach1_headers(base_df: pd.DataFrame, next_df: pd.DataFrame) -> pd.DataFrame:
@@ -831,7 +850,17 @@ def extract_attach1_with_border_grid(input_pdf: Path, verbose: bool = False) -> 
                 for table in tables:
                     row_count = int(getattr(table, "row_count", 0))
                     col_count = int(getattr(table, "col_count", 0))
-                    if row_count < 8 or col_count < 8:
+                    min_col_count = 8
+                    min_row_count = 8
+                    if pending_attach1 is not None:
+                        min_col_count = max(6, pending_attach1.df.shape[1] - 2)
+                        min_row_count = 2
+                    if row_count < min_row_count or col_count < min_col_count:
+                        if verbose:
+                            print(
+                                f"[{input_pdf.name}] p{page_idx+1} skip table rows={row_count} cols={col_count} "
+                                f"(need rows>={min_row_count}, cols>={min_col_count})"
+                            )
                         continue
 
                     raw_rows = getattr(table, "rows", None) or []
@@ -881,6 +910,10 @@ def extract_attach1_with_border_grid(input_pdf: Path, verbose: bool = False) -> 
                     )
 
             if not page_candidates:
+                if verbose and pending_attach1 is not None:
+                    print(
+                        f"[{input_pdf.name}] p{page_idx+1} no candidates; clear pending attach1 from p{pending_attach1.page}"
+                    )
                 pending_attach1 = None
                 continue
 
@@ -912,14 +945,27 @@ def extract_attach1_with_border_grid(input_pdf: Path, verbose: bool = False) -> 
                         layout_meta=candidate.layout_meta,
                     )
                     if _table_starts_new_attach_table(candidate.df) or _table_starts_new_section_title(candidate.df):
+                        if verbose:
+                            print(f"[{input_pdf.name}] p{page_idx+1} candidate rejected: new title/section signal")
                         continue
-                    if not detect_attach1_continuation(probe_prev, probe_next):
+                    ok, diag = _attach1_continuation_diagnostics(probe_prev, probe_next)
+                    if not ok:
+                        if verbose:
+                            print(
+                                f"[{input_pdf.name}] p{page_idx+1} continuation check failed "
+                                f"against pending p{pending_attach1.page}: {diag}"
+                            )
                         continue
                     boundary_score = _column_boundary_similarity(
                         _column_boundary_signature(pending_attach1.layout_meta),
                         _column_boundary_signature(candidate.layout_meta),
                     )
                     candidate_score = boundary_score + min(candidate.score / 10.0, 0.5)
+                    if verbose:
+                        print(
+                            f"[{input_pdf.name}] p{page_idx+1} continuation match with pending p{pending_attach1.page}: "
+                            f"diag={diag}, rank_score={candidate_score:.3f}"
+                        )
                     continuation_candidates.append((candidate_score, candidate))
                 if continuation_candidates:
                     accepted = max(continuation_candidates, key=lambda item: item[0])[1]
@@ -928,8 +974,15 @@ def extract_attach1_with_border_grid(input_pdf: Path, verbose: bool = False) -> 
                 previous = candidates_by_page.get(page_idx + 1)
                 if previous is None or accepted.score > previous.score:
                     candidates_by_page[page_idx + 1] = accepted
+                if verbose:
+                    print(
+                        f"[{input_pdf.name}] p{page_idx+1} keep attach1 candidate rows={accepted.df.shape[0]} "
+                        f"cols={accepted.df.shape[1]} score={accepted.score:.2f}; pending=ON"
+                    )
                 pending_attach1 = accepted
             else:
+                if verbose and pending_attach1 is not None:
+                    print(f"[{input_pdf.name}] p{page_idx+1} no accepted continuation; pending cleared")
                 pending_attach1 = None
     finally:
         document.close()
