@@ -495,6 +495,58 @@ def _table_bbox_with_page_size(
     return (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])), page_height_num, page_width_num
 
 
+def _column_boundary_signature(layout_meta: Optional[Dict[str, Any]]) -> List[float]:
+    if not isinstance(layout_meta, dict):
+        return []
+    canonical_cells = layout_meta.get("cells")
+    if not isinstance(canonical_cells, list):
+        return []
+    rows_info = layout_meta.get("canonical_grid", {})
+    col_count = rows_info.get("cols") if isinstance(rows_info, dict) else None
+    if not isinstance(col_count, int) or col_count <= 0:
+        return []
+
+    per_col: Dict[int, List[Tuple[float, float]]] = {idx: [] for idx in range(col_count)}
+    for cell in canonical_cells:
+        if not isinstance(cell, dict):
+            continue
+        col_idx = cell.get("col_idx")
+        rel_bbox = cell.get("bbox_rel")
+        if not isinstance(col_idx, int) or not isinstance(rel_bbox, (list, tuple)) or len(rel_bbox) < 4:
+            continue
+        try:
+            x0 = float(rel_bbox[0])
+            x1 = float(rel_bbox[2])
+        except (TypeError, ValueError):
+            continue
+        per_col.setdefault(col_idx, []).append((x0, x1))
+
+    boundaries: List[float] = []
+    for col_idx in range(col_count):
+        boxes = per_col.get(col_idx, [])
+        if boxes:
+            left = sum(v[0] for v in boxes) / len(boxes)
+            right = sum(v[1] for v in boxes) / len(boxes)
+        else:
+            left = float(col_idx) / col_count
+            right = float(col_idx + 1) / col_count
+        if col_idx == 0:
+            boundaries.append(left)
+        boundaries.append(right)
+    return boundaries
+
+
+def _column_boundary_similarity(boundaries_a: Sequence[float], boundaries_b: Sequence[float]) -> float:
+    if not boundaries_a or not boundaries_b:
+        return 0.0
+    min_len = min(len(boundaries_a), len(boundaries_b))
+    if min_len <= 1:
+        return 0.0
+    diffs = [abs(float(boundaries_a[idx]) - float(boundaries_b[idx])) for idx in range(min_len)]
+    mean_diff = sum(diffs) / min_len
+    return max(0.0, 1.0 - mean_diff * 3.5)
+
+
 def _is_data_like_row(row: Sequence[object]) -> bool:
     values = [normalize_cell(v) for v in row]
     non_empty = [v for v in values if v]
@@ -523,13 +575,24 @@ def _extract_serial_numbers(df: pd.DataFrame) -> List[int]:
     return serials
 
 
-def detect_attach1_continuation(prev_table: ExtractedTable, next_table: ExtractedTable) -> bool:
+def _attach1_continuation_diagnostics(
+    prev_table: ExtractedTable, next_table: ExtractedTable
+) -> Tuple[bool, Dict[str, Any]]:
+    details: Dict[str, Any] = {
+        "prev_page": prev_table.page,
+        "next_page": next_table.page,
+        "signals": 0,
+    }
     if next_table.page != prev_table.page + 1:
-        return False
+        details["reason"] = "not_adjacent_pages"
+        return False, details
     if _table_starts_new_attach_table(next_table.df) or _table_starts_new_section_title(next_table.df):
-        return False
+        details["reason"] = "new_table_or_section_title"
+        return False, details
 
     signals = 0
+    details["col_count_prev"] = prev_table.df.shape[1]
+    details["col_count_next"] = next_table.df.shape[1]
     if prev_table.df.shape[1] == next_table.df.shape[1]:
         signals += 2
     elif abs(prev_table.df.shape[1] - next_table.df.shape[1]) <= 1:
@@ -576,7 +639,23 @@ def detect_attach1_continuation(prev_table: ExtractedTable, next_table: Extracte
         if max(next_serials) >= max(prev_serials) and min(next_serials) <= max(prev_serials) + 3:
             signals += 1
 
-    return signals >= 3
+    prev_boundaries = _column_boundary_signature(prev_table.layout_meta)
+    next_boundaries = _column_boundary_signature(next_table.layout_meta)
+    boundary_similarity = _column_boundary_similarity(prev_boundaries, next_boundaries)
+    details["boundary_similarity"] = round(boundary_similarity, 4)
+    if boundary_similarity >= 0.78:
+        signals += 2
+    elif boundary_similarity >= 0.66:
+        signals += 1
+
+    details["signals"] = signals
+    details["reason"] = "passed" if signals >= 3 else "insufficient_signals"
+    return signals >= 3, details
+
+
+def detect_attach1_continuation(prev_table: ExtractedTable, next_table: ExtractedTable) -> bool:
+    ok, _ = _attach1_continuation_diagnostics(prev_table, next_table)
+    return ok
 
 
 def _drop_repeated_attach1_headers(base_df: pd.DataFrame, next_df: pd.DataFrame) -> pd.DataFrame:
@@ -660,13 +739,45 @@ def _merge_split_row_across_pages(base_df: pd.DataFrame, next_df: pd.DataFrame) 
     return next_df.iloc[1:].reset_index(drop=True)
 
 
+def _drop_tail_head_duplicate_rows(base_df: pd.DataFrame, next_df: pd.DataFrame) -> pd.DataFrame:
+    if base_df.empty or next_df.empty:
+        return next_df
+    overlap_limit = min(3, len(base_df), len(next_df))
+    if overlap_limit <= 0:
+        return next_df
+    drop_rows = 0
+    for overlap in range(overlap_limit, 0, -1):
+        base_slice = base_df.tail(overlap)
+        next_slice = next_df.head(overlap)
+        same = True
+        for row_idx in range(overlap):
+            base_row = _compact_row_signature(base_slice.iloc[row_idx].tolist())
+            next_row = _compact_row_signature(next_slice.iloc[row_idx].tolist())
+            if base_row != next_row:
+                same = False
+                break
+        if same:
+            drop_rows = overlap
+            break
+    if drop_rows <= 0:
+        return next_df
+    return next_df.iloc[drop_rows:].reset_index(drop=True)
+
+
+def _clean_text_spacing_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    return df.map(lambda value: normalize_split_numeric_fragments(normalize_cell(value)))
+
+
 def stitch_attach1_across_pages(tables: Sequence[ExtractedTable]) -> List[ExtractedTable]:
     if not tables:
         return []
     sorted_tables = sorted(tables, key=lambda table: (table.page, -table.score))
-    first_attach1_idx = next((idx for idx, table in enumerate(sorted_tables) if _attach1_table_title_signal(table)), 0)
-    if first_attach1_idx >= len(sorted_tables):
+    first_attach1_idx_opt = next((idx for idx, table in enumerate(sorted_tables) if _attach1_table_title_signal(table)), None)
+    if first_attach1_idx_opt is None:
         return []
+    first_attach1_idx = int(first_attach1_idx_opt)
 
     stitched_table = sorted_tables[first_attach1_idx]
     stitched_df = stitched_table.df.copy()
@@ -681,6 +792,7 @@ def stitch_attach1_across_pages(tables: Sequence[ExtractedTable]) -> List[Extrac
             break
         next_df = _drop_repeated_attach1_headers(stitched_df, table.df.copy())
         next_df = _merge_split_row_across_pages(stitched_df, next_df)
+        next_df = _drop_tail_head_duplicate_rows(stitched_df, next_df)
         if next_df.empty:
             last_page = table.page
             previous_table = table
@@ -691,7 +803,7 @@ def stitch_attach1_across_pages(tables: Sequence[ExtractedTable]) -> List[Extrac
 
     return [
         ExtractedTable(
-            df=stitched_df.reset_index(drop=True),
+            df=_clean_text_spacing_dataframe(stitched_df).reset_index(drop=True),
             page=stitched_table.page,
             engine=stitched_table.engine,
             score=stitched_table.score,
@@ -720,13 +832,15 @@ def extract_attach1_with_border_grid(input_pdf: Path, verbose: bool = False) -> 
         return []
 
     candidates_by_page: Dict[int, ExtractedTable] = {}
+    pending_attach1: Optional[ExtractedTable] = None
     try:
         for page_idx, page in enumerate(document):
             page_text = page.get_text("text") or ""
             page_has_attach1_title = "附表1" in page_text
-            if not page_has_attach1_title and not candidates_by_page:
+            if not page_has_attach1_title and pending_attach1 is None and not candidates_by_page:
                 continue
 
+            page_candidates: List[ExtractedTable] = []
             for strategy in ("lines_strict", "lines"):
                 try:
                     finder = page.find_tables(strategy=strategy)
@@ -736,7 +850,17 @@ def extract_attach1_with_border_grid(input_pdf: Path, verbose: bool = False) -> 
                 for table in tables:
                     row_count = int(getattr(table, "row_count", 0))
                     col_count = int(getattr(table, "col_count", 0))
-                    if row_count < 8 or col_count < 8:
+                    min_col_count = 8
+                    min_row_count = 8
+                    if pending_attach1 is not None:
+                        min_col_count = max(6, pending_attach1.df.shape[1] - 2)
+                        min_row_count = 2
+                    if row_count < min_row_count or col_count < min_col_count:
+                        if verbose:
+                            print(
+                                f"[{input_pdf.name}] p{page_idx+1} skip table rows={row_count} cols={col_count} "
+                                f"(need rows>={min_row_count}, cols>={min_col_count})"
+                            )
                         continue
 
                     raw_rows = getattr(table, "rows", None) or []
@@ -770,13 +894,12 @@ def extract_attach1_with_border_grid(input_pdf: Path, verbose: bool = False) -> 
                         continue
                     df = pd.DataFrame(grid_values)
                     hits = _attach1_keyword_hits(df)
-                    if hits < (4 if page_has_attach1_title else 5):
-                        continue
 
                     layout_meta = _finalize_layout_meta(raw_cells, df.shape[0], df.shape[1], f"pymupdf_{strategy}")
                     layout_meta["page_width"] = float(page.rect.width)
                     layout_meta["page_height"] = float(page.rect.height)
-                    candidate = ExtractedTable(
+                    page_candidates.append(
+                        ExtractedTable(
                         df=df.map(lambda value: normalize_split_numeric_fragments(normalize_cell(value))),
                         page=page_idx + 1,
                         engine=f"pymupdf_{strategy}",
@@ -784,9 +907,83 @@ def extract_attach1_with_border_grid(input_pdf: Path, verbose: bool = False) -> 
                         title="附表1",
                         layout_meta=layout_meta,
                     )
-                    previous = candidates_by_page.get(page_idx + 1)
-                    if previous is None or candidate.score > previous.score:
-                        candidates_by_page[page_idx + 1] = candidate
+                    )
+
+            if not page_candidates:
+                if verbose and pending_attach1 is not None:
+                    print(
+                        f"[{input_pdf.name}] p{page_idx+1} no candidates; clear pending attach1 from p{pending_attach1.page}"
+                    )
+                pending_attach1 = None
+                continue
+
+            accepted: Optional[ExtractedTable] = None
+            strong_candidates = [
+                candidate
+                for candidate in page_candidates
+                if candidate.score >= (4 if page_has_attach1_title else 5) or page_has_attach1_title
+            ]
+            if strong_candidates:
+                accepted = max(strong_candidates, key=lambda item: item.score)
+            elif pending_attach1 is not None:
+                continuation_candidates: List[Tuple[float, ExtractedTable]] = []
+                for candidate in page_candidates:
+                    probe_prev = ExtractedTable(
+                        df=pending_attach1.df,
+                        page=pending_attach1.page,
+                        engine=pending_attach1.engine,
+                        score=pending_attach1.score,
+                        title="附表1",
+                        layout_meta=pending_attach1.layout_meta,
+                    )
+                    probe_next = ExtractedTable(
+                        df=candidate.df,
+                        page=candidate.page,
+                        engine=candidate.engine,
+                        score=candidate.score,
+                        title=None,
+                        layout_meta=candidate.layout_meta,
+                    )
+                    if _table_starts_new_attach_table(candidate.df) or _table_starts_new_section_title(candidate.df):
+                        if verbose:
+                            print(f"[{input_pdf.name}] p{page_idx+1} candidate rejected: new title/section signal")
+                        continue
+                    ok, diag = _attach1_continuation_diagnostics(probe_prev, probe_next)
+                    if not ok:
+                        if verbose:
+                            print(
+                                f"[{input_pdf.name}] p{page_idx+1} continuation check failed "
+                                f"against pending p{pending_attach1.page}: {diag}"
+                            )
+                        continue
+                    boundary_score = _column_boundary_similarity(
+                        _column_boundary_signature(pending_attach1.layout_meta),
+                        _column_boundary_signature(candidate.layout_meta),
+                    )
+                    candidate_score = boundary_score + min(candidate.score / 10.0, 0.5)
+                    if verbose:
+                        print(
+                            f"[{input_pdf.name}] p{page_idx+1} continuation match with pending p{pending_attach1.page}: "
+                            f"diag={diag}, rank_score={candidate_score:.3f}"
+                        )
+                    continuation_candidates.append((candidate_score, candidate))
+                if continuation_candidates:
+                    accepted = max(continuation_candidates, key=lambda item: item[0])[1]
+
+            if accepted is not None:
+                previous = candidates_by_page.get(page_idx + 1)
+                if previous is None or accepted.score > previous.score:
+                    candidates_by_page[page_idx + 1] = accepted
+                if verbose:
+                    print(
+                        f"[{input_pdf.name}] p{page_idx+1} keep attach1 candidate rows={accepted.df.shape[0]} "
+                        f"cols={accepted.df.shape[1]} score={accepted.score:.2f}; pending=ON"
+                    )
+                pending_attach1 = accepted
+            else:
+                if verbose and pending_attach1 is not None:
+                    print(f"[{input_pdf.name}] p{page_idx+1} no accepted continuation; pending cleared")
+                pending_attach1 = None
     finally:
         document.close()
 
