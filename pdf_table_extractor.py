@@ -19,6 +19,10 @@ from paragraph_metric_extractor import (
     demo_extract_market_section_metrics,
     extract_configured_sections_from_pdf,
 )
+from shandong_monthly_extractor import (
+    ShandongExtractionResult,
+    extract_shandong_market_disclosure_monthly_report,
+)
 
 @dataclass
 class ExtractedTable:
@@ -2154,6 +2158,32 @@ def is_monthly_report_file(input_pdf: Path) -> bool:
     return "广东电力现货市场结算运行情况月报" in input_pdf.name
 
 
+def is_shandong_monthly_report_file(input_pdf: Path) -> bool:
+    return "山东电力市场信息披露月报" in input_pdf.name
+
+
+def write_shandong_excel(
+    output_path: Path,
+    shandong_result: ShandongExtractionResult,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    info_df = pd.DataFrame(
+        shandong_result.info_rows,
+        columns=["报告月份", "section", "subsection", "field", "value", "unit", "source_text", "notes"],
+    )
+    if info_df.empty:
+        info_df = pd.DataFrame(
+            columns=["报告月份", "section", "subsection", "field", "value", "unit", "source_text", "notes"]
+        )
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        info_df.to_excel(writer, index=False, sheet_name="山东_信息汇总")
+        for sheet_name in ["山东_表2_中长期交易情况_raw", "山东_表3_现货交易情况_raw", "山东_表8_市场运行费用_raw"]:
+            table_df = shandong_result.raw_tables.get(sheet_name, pd.DataFrame(columns=["raw"]))
+            table_df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+        diag_df = pd.DataFrame({"diagnostics": shandong_result.diagnostics})
+        diag_df.to_excel(writer, index=False, sheet_name="_diagnostics")
+
+
 def main() -> int:
     args = parse_args()
 
@@ -2191,6 +2221,7 @@ def main() -> int:
                         )
                 return 0
             monthly_report = is_monthly_report_file(input_pdf)
+            shandong_report = is_shandong_monthly_report_file(input_pdf)
             extracted: List[ExtractedTable] = []
             if monthly_report:
                 attach1_border_tables = extract_attach1_with_border_grid(input_pdf, args.verbose)
@@ -2216,21 +2247,36 @@ def main() -> int:
                     str(input_pdf),
                     default_section_configs(),
                 )
+            elif shandong_report:
+                section_results = []
             else:
                 section_results = extract_configured_sections_from_pdf(
                     str(input_pdf),
                     default_section_configs(),
                 )
             output_path = build_output_path(args, input_pdf, batch_mode)
-            write_excel(
-                output_path,
-                extracted,
-                excel_style_mode=args.excel_style_mode,
-                section_results=section_results,
-                include_summary_sheet=not monthly_report,
-                table_sheet_base_name="附表1" if monthly_report else "Table",
-                table_write_header=not monthly_report,
-            )
+            if shandong_report:
+                shandong_result = extract_shandong_market_disclosure_monthly_report(
+                    pdf_path=str(input_pdf),
+                    text=None,
+                    tables=extracted,
+                    output_path=str(output_path),
+                    diagnostics=[],
+                )
+                write_shandong_excel(output_path, shandong_result)
+                if args.verbose:
+                    for diag in shandong_result.diagnostics:
+                        log(f"[Shandong] {diag}", args.verbose)
+            else:
+                write_excel(
+                    output_path,
+                    extracted,
+                    excel_style_mode=args.excel_style_mode,
+                    section_results=section_results,
+                    include_summary_sheet=not monthly_report,
+                    table_sheet_base_name="附表1" if monthly_report else "Table",
+                    table_write_header=not monthly_report,
+                )
             print(f"[OK] {input_pdf.name}: saved {len(extracted)} table(s) to {output_path}")
         except Exception as exc:
             print(f"[FAILED] {input_pdf}: {exc}", file=sys.stderr)
