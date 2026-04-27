@@ -15,10 +15,10 @@ class ShandongExtractorTest(unittest.TestCase):
             "一、电网概览\n"
             "（一）全省全社会用电情况\n"
             "第一产业用电量\n12.34 亿千瓦时，同比增长\n5.6%\n"
-            "城乡居民生活\n用电量\n123.45 亿千瓦时\n同比增长 6.7%\n"
+            "城乡居民生活用电\n量 12.34 亿千瓦时，同比增长 5.6%。\n"
             "（二）全省发电机组装机及发电总体情况\n"
             "全省发电装机总容量\n124881.25 万千瓦。\n"
-            "其中火电3000万千瓦，太阳能发电 2500万千瓦。全省发电量800亿千瓦时，太阳能发电量60亿千瓦时。\n"
+            "其中火电3000万千瓦，太阳能发电 2500万千瓦。全省发电量800亿千瓦时，太阳能\n发电量123.45亿千瓦时，占比10.2%。\n"
             "四、交易组织情况 （三）绿电交易组织情况 组织5次省内绿电交易，成交电量2.1亿千瓦时，环境溢价20元/兆瓦时。\n"
             "五、市场结算情况 （一）发电侧交易结算情况 省内发电侧共结算上网电量600亿千瓦时。2.跨省跨区交易结算情况 跨省跨区交易结算电量80亿千瓦时。\n"
             "（二）用电侧交易结算情况 1.批发侧结算总体情况 用电批发侧总结算电量550亿千瓦时。\n"
@@ -41,11 +41,11 @@ class ShandongExtractorTest(unittest.TestCase):
 
         self.assertEqual(value_by_field.get("第一产业用电量"), "12.34")
         self.assertEqual(value_by_field.get("第一产业同比增长"), "5.6")
-        self.assertEqual(value_by_field.get("城乡居民生活用电量"), "123.45")
-        self.assertEqual(value_by_field.get("城乡居民生活用电量同比增长"), "6.7")
+        self.assertEqual(value_by_field.get("城乡居民生活用电量"), "12.34")
+        self.assertEqual(value_by_field.get("城乡居民生活用电量同比增长"), "5.6")
         self.assertEqual(value_by_field.get("全省发电装机总容量"), "24881.25")
         self.assertEqual(value_by_field.get("太阳能发电装机容量"), "2500")
-        self.assertEqual(value_by_field.get("太阳能发电量"), "60")
+        self.assertEqual(value_by_field.get("太阳能发电量"), "123.45")
         self.assertIn("疑似脚注数字并入数值", notes_by_field.get("全省发电装机总容量", ""))
         self.assertNotIn("月份", {row["field"] for row in result.info_rows})
 

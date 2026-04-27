@@ -52,7 +52,7 @@ def remove_shandong_watermarks(text: str) -> str:
     return pattern.sub(" ", text)
 
 
-def normalize_shandong_text_for_regex(text: str) -> str:
+def normalize_shandong_readable_text(text: str) -> str:
     text = remove_shandong_watermarks(text)
     text = text.replace("\u3000", " ").replace("\xa0", " ")
     text = text.replace("（", "(").replace("）", ")")
@@ -74,6 +74,22 @@ def normalize_shandong_text_for_regex(text: str) -> str:
     text = re.sub(r"(?<=\d)\s+(?=(?:亿千瓦时|万千瓦时|万千瓦|元/兆瓦时|%))", "", text)
 
     return text.strip()
+
+
+def compact_shandong_text_for_matching(text: str) -> str:
+    """
+    OCR often splits semantic labels across physical lines (e.g. '用电\\n量', '太阳能\\n发电量').
+    We keep readable text for diagnostics, but field matching uses this compact text.
+    """
+    compact = normalize_shandong_readable_text(text)
+    compact = re.sub(r"[，,。；;：:（）()【】\\[\\]、\\-—_]+", "", compact)
+    compact = re.sub(r"\s+", "", compact)
+    return compact
+
+
+def normalize_shandong_text_for_regex(text: str) -> str:
+    # Backward-compatible alias used by existing callers.
+    return normalize_shandong_readable_text(text)
 
 
 def _heading_pattern(heading: str) -> re.Pattern[str]:
@@ -176,6 +192,30 @@ def _extract_number_near_label(
     return None, None, None
 
 
+def extract_from_compact_text(
+    compact_text: str,
+    label_variants: Sequence[str],
+    unit_pattern: str,
+    field_name: str,
+    readable_context: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
+    for label in label_variants:
+        pattern = rf"{label}(?P<value>[+-]?\d+(?:\.\d+)?)(?P<unit>{unit_pattern})"
+        m = re.search(pattern, compact_text)
+        if not m:
+            continue
+        raw_value = m.group("value")
+        unit = m.group("unit")
+        cleaned, note = clean_shandong_numeric_value(
+            raw_value,
+            field_name=field_name,
+            unit=unit,
+            context_text=readable_context or compact_text,
+        )
+        return cleaned, unit, note, m.end()
+    return None, None, None, None
+
+
 def _extract_percent_near_label(section_text: str, field_name: str, label_patterns: Sequence[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     return _extract_number_near_label(section_text, field_name, label_patterns, [r"%"])
 
@@ -249,6 +289,8 @@ def _find_keyword_excerpt(text: str, keywords: Sequence[str], window: int = 40) 
 
 
 def parse_shandong_power_consumption(section_text: str, report_month: Optional[str]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    readable_text = normalize_shandong_readable_text(section_text)
+    compact_text = compact_shandong_text_for_matching(section_text)
     cfg = [
         ("第一产业用电量", [r"第一产业(?:用电量)?"], [r"亿千瓦时", r"万千瓦时"], False),
         ("第一产业同比增长", [r"第一产业[\s\S]{0,40}?同比(?:增长)?"], [r"%"], True),
@@ -257,20 +299,68 @@ def parse_shandong_power_consumption(section_text: str, report_month: Optional[s
         ("第三产业用电量", [r"第三产业(?:用电量)?"], [r"亿千瓦时", r"万千瓦时"], False),
         ("第三产业同比增长", [r"第三产业[\s\S]{0,40}?同比(?:增长)?"], [r"%"], True),
         ("全社会用电量", [r"全社会用电量"], [r"亿千瓦时", r"万千瓦时"], False),
-        ("城乡居民生活用电量", [r"城乡居民生活\s*用电量|居民生活\s*用电量"], [r"亿千瓦时", r"万千瓦时"], False),
-        ("城乡居民生活用电量同比增长", [r"城乡居民生活\s*用电量[\s\S]{0,80}?同比(?:增长)?|居民生活\s*用电量[\s\S]{0,80}?同比(?:增长)?"], [r"%"], True),
+        ("城乡居民生活用电量", [r"城乡居民生活\s*用电量|居民生活\s*用电量|城乡居民用电量"], [r"亿千瓦时", r"万千瓦时"], False),
     ]
-    return _extract_fields(section_text, report_month, "一、电网概览", "（一）全省全社会用电情况", cfg)
+    rows, warnings = _extract_fields(readable_text, report_month, "一、电网概览", "（一）全省全社会用电情况", cfg)
+
+    # Compact matching for OCR split labels: 城乡居民生活用电\n量 / 居民生活用电\n量
+    resident_labels = [r"城乡居民生活用电量", r"居民生活用电量", r"城乡居民用电量"]
+    value, unit, note, end_pos = extract_from_compact_text(
+        compact_text,
+        resident_labels,
+        r"(?:亿千瓦时|万千瓦时)",
+        field_name="城乡居民生活用电量",
+        readable_context=readable_text,
+    )
+    resident_value_row = next((r for r in rows if r["field"] == "城乡居民生活用电量"), None)
+    if resident_value_row and value is not None:
+        resident_value_row["value"] = value
+        resident_value_row["unit"] = unit
+        resident_value_row["notes"] = note or ""
+        warnings = [w for w in warnings if w != "未提取到城乡居民生活用电量"]
+
+    yoy_value, yoy_unit = None, None
+    if end_pos is not None:
+        tail = compact_text[end_pos : min(len(compact_text), end_pos + 80)]
+        yoy_match = re.search(r"(?:同比增长|同比|增长)(?P<value>[+-]?\d+(?:\.\d+)?)%", tail)
+        if yoy_match:
+            yoy_value = yoy_match.group("value")
+            yoy_unit = "%"
+
+    existing_yoy_row = next((r for r in rows if r["field"] == "城乡居民生活用电量同比增长"), None)
+    if existing_yoy_row is None:
+        _add_row(
+            rows,
+            report_month,
+            "一、电网概览",
+            "（一）全省全社会用电情况",
+            "城乡居民生活用电量同比增长",
+            yoy_value,
+            yoy_unit,
+            "" if yoy_value is not None else "missing",
+        )
+    elif yoy_value is not None:
+        existing_yoy_row["value"] = yoy_value
+        existing_yoy_row["unit"] = yoy_unit
+        existing_yoy_row["notes"] = ""
+
+    if yoy_value is None:
+        if "未提取到城乡居民生活用电量同比增长" not in warnings:
+            warnings.append("未提取到城乡居民生活用电量同比增长")
+    else:
+        warnings = [w for w in warnings if w != "未提取到城乡居民生活用电量同比增长"]
+    return rows, warnings
 
 
 def parse_shandong_capacity_and_generation(section_text: str, report_month: Optional[str]) -> Tuple[List[Dict[str, Any]], List[str]]:
-    generation_anchor = re.search(r"全省发电量", section_text)
+    readable_text = normalize_shandong_readable_text(section_text)
+    generation_anchor = re.search(r"全省发电量", readable_text)
     if generation_anchor:
-        installed_capacity_text = section_text[: generation_anchor.start()]
-        generation_text = section_text[generation_anchor.start() :]
+        installed_capacity_text = readable_text[: generation_anchor.start()]
+        generation_text = readable_text[generation_anchor.start() :]
     else:
-        installed_capacity_text = section_text
-        generation_text = section_text
+        installed_capacity_text = readable_text
+        generation_text = readable_text
 
     installed_cfg = [
         ("全省发电装机总容量", [r"全省发电装机总容量|全省发电装机容量|全省装机总容量"], [r"万千瓦"], False),
@@ -302,6 +392,29 @@ def parse_shandong_capacity_and_generation(section_text: str, report_month: Opti
         "（二）全省发电机组装机及发电总体情况",
         generation_cfg,
     )
+    # Parse generation with compact label binding so each energy source binds to nearest own value.
+    generation_compact = compact_shandong_text_for_matching(generation_text)
+    energy_label_map = {
+        "水电发电量": [r"水电发电量", r"水电"],
+        "火电发电量": [r"火电发电量", r"火电"],
+        "核电发电量": [r"核电发电量", r"核电"],
+        "风电发电量": [r"风电发电量", r"风电"],
+        "太阳能发电量": [r"太阳能发电量", r"光伏发电量", r"太阳能发电", r"太阳能", r"光伏"],
+    }
+    for field_name, labels in energy_label_map.items():
+        value, unit, note, _ = extract_from_compact_text(
+            generation_compact,
+            labels,
+            r"(?:亿千瓦时|万千瓦时)",
+            field_name=field_name,
+            readable_context=generation_text,
+        )
+        row = next((r for r in rows2 if r["field"] == field_name), None)
+        if row and value is not None:
+            row["value"] = value
+            row["unit"] = unit
+            row["notes"] = note or ""
+            warns2 = [w for w in warns2 if w != f"未提取到{field_name}"]
     return rows1 + rows2, warns1 + warns2
 
 
@@ -427,8 +540,21 @@ def extract_shandong_market_disclosure_monthly_report(
         diags.extend([f"[WARN] {w}" for w in warns])
         if any(row["field"] == "城乡居民生活用电量" and row["value"] is None for row in parsed):
             diags.append(
-                "[DEBUG] 城乡居民生活用电量邻近文本: "
+                "[DEBUG] 城乡居民生活用电量邻近文本(可读): "
                 + _find_keyword_excerpt(power_sec, ["城乡居民", "居民生活"])
+            )
+            diags.append(
+                "[DEBUG] 城乡居民生活用电量邻近文本(紧凑): "
+                + _find_keyword_excerpt(compact_shandong_text_for_matching(power_sec), ["城乡居民", "居民生活"])
+            )
+        if any(row["field"] == "城乡居民生活用电量同比增长" and row["value"] is None for row in parsed):
+            diags.append(
+                "[DEBUG] 城乡居民生活用电量同比增长邻近文本(可读): "
+                + _find_keyword_excerpt(power_sec, ["城乡居民", "居民生活", "同比"])
+            )
+            diags.append(
+                "[DEBUG] 城乡居民生活用电量同比增长邻近文本(紧凑): "
+                + _find_keyword_excerpt(compact_shandong_text_for_matching(power_sec), ["城乡居民", "居民生活", "同比"])
             )
         diags.append("[OK] 解析章节：（一）全省全社会用电情况")
     else:
@@ -441,8 +567,21 @@ def extract_shandong_market_disclosure_monthly_report(
         diags.extend([f"[WARN] {w}" for w in warns])
         if any(row["field"] == "太阳能发电装机容量" and row["value"] is None for row in parsed):
             diags.append(
-                "[DEBUG] 太阳能发电装机容量邻近文本: "
+                "[DEBUG] 太阳能发电装机容量邻近文本(可读): "
                 + _find_keyword_excerpt(cap_gen_sec, ["太阳能", "光伏"])
+            )
+            diags.append(
+                "[DEBUG] 太阳能发电装机容量邻近文本(紧凑): "
+                + _find_keyword_excerpt(compact_shandong_text_for_matching(cap_gen_sec), ["太阳能", "光伏"])
+            )
+        if any(row["field"] == "太阳能发电量" and row["value"] is None for row in parsed):
+            diags.append(
+                "[DEBUG] 太阳能发电量邻近文本(可读): "
+                + _find_keyword_excerpt(cap_gen_sec, ["太阳能", "光伏", "发电量"])
+            )
+            diags.append(
+                "[DEBUG] 太阳能发电量邻近文本(紧凑): "
+                + _find_keyword_excerpt(compact_shandong_text_for_matching(cap_gen_sec), ["太阳能", "光伏", "发电量"])
             )
         diags.append("[OK] 解析章节：（二）全省发电机组装机及发电总体情况")
     else:
