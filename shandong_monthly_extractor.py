@@ -238,6 +238,16 @@ def _extract_fields(
     return rows, warnings
 
 
+def _find_keyword_excerpt(text: str, keywords: Sequence[str], window: int = 40) -> str:
+    for keyword in keywords:
+        m = re.search(re.escape(keyword), text)
+        if m:
+            start = max(0, m.start() - window)
+            end = min(len(text), m.end() + window)
+            return text[start:end]
+    return text[: min(len(text), 120)]
+
+
 def parse_shandong_power_consumption(section_text: str, report_month: Optional[str]) -> Tuple[List[Dict[str, Any]], List[str]]:
     cfg = [
         ("第一产业用电量", [r"第一产业(?:用电量)?"], [r"亿千瓦时", r"万千瓦时"], False),
@@ -247,27 +257,52 @@ def parse_shandong_power_consumption(section_text: str, report_month: Optional[s
         ("第三产业用电量", [r"第三产业(?:用电量)?"], [r"亿千瓦时", r"万千瓦时"], False),
         ("第三产业同比增长", [r"第三产业[\s\S]{0,40}?同比(?:增长)?"], [r"%"], True),
         ("全社会用电量", [r"全社会用电量"], [r"亿千瓦时", r"万千瓦时"], False),
-        ("城乡居民生活用电量", [r"城乡居民生活用电量"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("城乡居民生活用电量", [r"城乡居民生活\s*用电量|居民生活\s*用电量"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("城乡居民生活用电量同比增长", [r"城乡居民生活\s*用电量[\s\S]{0,80}?同比(?:增长)?|居民生活\s*用电量[\s\S]{0,80}?同比(?:增长)?"], [r"%"], True),
     ]
     return _extract_fields(section_text, report_month, "一、电网概览", "（一）全省全社会用电情况", cfg)
 
 
 def parse_shandong_capacity_and_generation(section_text: str, report_month: Optional[str]) -> Tuple[List[Dict[str, Any]], List[str]]:
-    cfg = [
+    generation_anchor = re.search(r"全省发电量", section_text)
+    if generation_anchor:
+        installed_capacity_text = section_text[: generation_anchor.start()]
+        generation_text = section_text[generation_anchor.start() :]
+    else:
+        installed_capacity_text = section_text
+        generation_text = section_text
+
+    installed_cfg = [
         ("全省发电装机总容量", [r"全省发电装机总容量|全省发电装机容量|全省装机总容量"], [r"万千瓦"], False),
         ("水电装机容量", [r"水电装机(?:容量)?|水电"], [r"万千瓦"], False),
         ("核电装机容量", [r"核电装机(?:容量)?|核电"], [r"万千瓦"], False),
         ("火电装机容量", [r"火电装机(?:容量)?|火电"], [r"万千瓦"], False),
         ("风电装机容量", [r"风电装机(?:容量)?|风电"], [r"万千瓦"], False),
-        ("太阳能发电装机容量", [r"太阳能发电装机(?:容量)?|光伏装机(?:容量)?"], [r"万千瓦"], False),
+        ("太阳能发电装机容量", [r"太阳能发电装机(?:容量)?|太阳能发电|太阳能|光伏(?:装机(?:容量)?)?"], [r"万千瓦"], False),
+    ]
+    generation_cfg = [
         ("全省发电量", [r"全省发电量"], [r"亿千瓦时", r"万千瓦时"], False),
         ("水电发电量", [r"水电发电量|水电"], [r"亿千瓦时", r"万千瓦时"], False),
         ("火电发电量", [r"火电发电量|火电"], [r"亿千瓦时", r"万千瓦时"], False),
         ("核电发电量", [r"核电发电量|核电"], [r"亿千瓦时", r"万千瓦时"], False),
         ("风电发电量", [r"风电发电量|风电"], [r"亿千瓦时", r"万千瓦时"], False),
-        ("太阳能发电量", [r"太阳能发电量|光伏发电量|太阳能发电"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("太阳能发电量", [r"太阳能发电量|光伏发电量|太阳能发电|光伏"], [r"亿千瓦时", r"万千瓦时"], False),
     ]
-    return _extract_fields(section_text, report_month, "一、电网概览", "（二）全省发电机组装机及发电总体情况", cfg)
+    rows1, warns1 = _extract_fields(
+        installed_capacity_text,
+        report_month,
+        "一、电网概览",
+        "（二）全省发电机组装机及发电总体情况",
+        installed_cfg,
+    )
+    rows2, warns2 = _extract_fields(
+        generation_text,
+        report_month,
+        "一、电网概览",
+        "（二）全省发电机组装机及发电总体情况",
+        generation_cfg,
+    )
+    return rows1 + rows2, warns1 + warns2
 
 
 def parse_shandong_green_power_trade(section_text: str, report_month: Optional[str]) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -296,9 +331,6 @@ def parse_shandong_user_side_settlement(section_text: str, report_month: Optiona
     rows: List[Dict[str, Any]] = []
     warnings: List[str] = []
 
-    month_value = re.search(r"(?P<value>\d{1,2})月(?:份)?", section_text)
-    _add_row(rows, report_month, "五、市场结算情况", "2. 零售侧结算情况", "月份", month_value.group("value") if month_value else None, "月" if month_value else None, "" if month_value else "missing")
-
     cfg = [
         ("用电批发侧总结算电量", [r"用电批发侧总?结算电量|批发侧结算总体情况"], [r"亿千瓦时", r"万千瓦时"], False),
         ("零售用户数量", [r"零售用户"], [r"家"], False),
@@ -310,9 +342,6 @@ def parse_shandong_user_side_settlement(section_text: str, report_month: Optiona
     parsed, warns = _extract_fields(section_text, report_month, "五、市场结算情况", "（二）用电侧交易结算情况", cfg)
     rows.extend(parsed)
     warnings.extend(warns)
-
-    if month_value is None:
-        warnings.append("未提取到月份")
     return rows, warnings
 
 
@@ -396,6 +425,11 @@ def extract_shandong_market_disclosure_monthly_report(
         parsed, warns = parse_shandong_power_consumption(power_sec, report_month)
         rows.extend(parsed)
         diags.extend([f"[WARN] {w}" for w in warns])
+        if any(row["field"] == "城乡居民生活用电量" and row["value"] is None for row in parsed):
+            diags.append(
+                "[DEBUG] 城乡居民生活用电量邻近文本: "
+                + _find_keyword_excerpt(power_sec, ["城乡居民", "居民生活"])
+            )
         diags.append("[OK] 解析章节：（一）全省全社会用电情况")
     else:
         diags.append("[WARN] 未找到章节：（一）全省全社会用电情况")
@@ -405,6 +439,11 @@ def extract_shandong_market_disclosure_monthly_report(
         parsed, warns = parse_shandong_capacity_and_generation(cap_gen_sec, report_month)
         rows.extend(parsed)
         diags.extend([f"[WARN] {w}" for w in warns])
+        if any(row["field"] == "太阳能发电装机容量" and row["value"] is None for row in parsed):
+            diags.append(
+                "[DEBUG] 太阳能发电装机容量邻近文本: "
+                + _find_keyword_excerpt(cap_gen_sec, ["太阳能", "光伏"])
+            )
         diags.append("[OK] 解析章节：（二）全省发电机组装机及发电总体情况")
     else:
         diags.append("[WARN] 未找到章节：（二）全省发电机组装机及发电总体情况")
