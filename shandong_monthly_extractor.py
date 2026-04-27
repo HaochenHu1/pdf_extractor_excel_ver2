@@ -969,16 +969,12 @@ def extract_shandong_market_disclosure_monthly_report(
     else:
         diags.append("[WARN] 未找到章节：（二）用电侧交易结算情况")
 
+    # Temporary switch: disable Shandong table extraction (表2/表3/表8), keep info extraction only.
+    diags.append("[INFO] 已临时关闭山东表格提取（表2/表3/表8），当前仅输出山东_信息汇总。")
     raw_tables = {
-        "山东_表2_中长期交易情况": parse_shandong_table_2_cumulative_trade_only(
-            tables, None, normalized, diags
-        ),
-        "山东_表3_现货交易情况": parse_shandong_table_3_spot_trade_across_pages(
-            tables, None, normalized, diags, report_month=report_month
-        ),
-        "山东_表8_市场运行费用": parse_shandong_table_8_market_operation_fee_settlement(
-            tables, None, normalized, diags
-        ),
+        "山东_表2_中长期交易情况": pd.DataFrame(),
+        "山东_表3_现货交易情况": pd.DataFrame(),
+        "山东_表8_市场运行费用": pd.DataFrame(),
     }
 
     return ShandongExtractionResult(
