@@ -2171,7 +2171,7 @@ def write_shandong_excel(
     info_df = build_shandong_info_dataframe(shandong_result.info_rows)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         info_df.to_excel(writer, index=False, sheet_name="山东_信息汇总")
-        for sheet_name in ["山东_表2_中长期交易情况_raw", "山东_表3_现货交易情况_raw", "山东_表8_市场运行费用_raw"]:
+        for sheet_name in ["山东_表2_中长期交易情况", "山东_表3_现货交易情况", "山东_表8_市场运行费用"]:
             table_df = shandong_result.raw_tables.get(sheet_name, pd.DataFrame(columns=["raw"]))
             table_df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
         diag_df = pd.DataFrame({"diagnostics": shandong_result.diagnostics})

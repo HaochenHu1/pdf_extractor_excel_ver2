@@ -1,11 +1,24 @@
 import unittest
 
+import pandas as pd
+
 from shandong_monthly_extractor import (
     build_shandong_info_dataframe,
     extract_shandong_market_disclosure_monthly_report,
+    is_table3_continuation_page,
     normalize_shandong_text_for_regex,
+    parse_shandong_table_2_medium_long_term_trade_upper_half,
+    parse_shandong_table_3_spot_trade_across_pages,
+    parse_shandong_table_8_market_operation_fee_settlement,
     remove_shandong_watermarks,
 )
+
+
+class DummyTable:
+    def __init__(self, page, title, df):
+        self.page = page
+        self.title = title
+        self.df = df
 
 
 class ShandongExtractorTest(unittest.TestCase):
@@ -83,6 +96,76 @@ class ShandongExtractorTest(unittest.TestCase):
         cleaned = normalize_shandong_text_for_regex(src)
         self.assertIn("12.34亿千瓦时", cleaned)
         self.assertIn("5.6%", cleaned)
+
+    def test_table3_split_across_pages_merge(self):
+        df1 = pd.DataFrame(
+            [
+                ["日期", "发电侧日前出清电量", "用电侧日前出清电量", "日前出清均价", "发电侧实时出清电量", "实时出清均价"],
+                ["08月01日", "1.1", "1.2", "320", "0.9", "330"],
+                ["08月24日", "2.1", "2.2", "321", "1.9", "331"],
+            ]
+        )
+        df2 = pd.DataFrame(
+            [
+                ["08月25日", "2.3", "2.4", "322", "2.0", "332"],
+                ["08月31日", "2.9", "3.0", "323", "2.1", "333"],
+                ["合计", "50", "51", "324", "40", "334"],
+            ]
+        )
+        tables = [
+            DummyTable(4, "表3：现货交易情况", df1),
+            DummyTable(5, "", df2),
+        ]
+        diags = []
+        out = parse_shandong_table_3_spot_trade_across_pages(tables, None, "", diags, report_month="2025-08")
+        self.assertIn("08月01日", out["日期"].tolist())
+        self.assertIn("08月24日", out["日期"].tolist())
+        self.assertIn("08月25日", out["日期"].tolist())
+        self.assertIn("08月31日", out["日期"].tolist())
+        self.assertIn("合计", out["日期"].tolist())
+        self.assertTrue(any("表3续页" in d for d in diags))
+
+    def test_table8_multiline_cells_anchor_by_serial(self):
+        df = pd.DataFrame(
+            [
+                ["序号", "类别", "费用总额", "分摊返还均价", "分摊返还主体"],
+                ["4", "新能源场站偏差收益", "10", "0.1", "主体A"],
+                ["", "回收", "", "", "主体A补充"],
+                ["7", "用户侧日前申报偏差", "11", "0.2", "主体B"],
+                ["", "收益回收", "", "", ""],
+            ]
+        )
+        diags = []
+        out = parse_shandong_table_8_market_operation_fee_settlement([DummyTable(8, "表8：市场运行费用总体结算情况", df)], None, "", diags)
+        row4 = out[out["序号"] == "4"].iloc[0]
+        row7 = out[out["序号"] == "7"].iloc[0]
+        self.assertIn("新能源场站偏差收益", row4["类别"])
+        self.assertIn("回收", row4["类别"])
+        self.assertIn("用户侧日前申报偏差", row7["类别"])
+        self.assertIn("收益回收", row7["类别"])
+
+    def test_table2_upper_half_only(self):
+        df = pd.DataFrame(
+            [
+                ["（一）中长期累计交易情况", "", ""],
+                ["交易品种", "累计合约量", "加权平均电价"],
+                ["年度双边协商交易", "10", "320"],
+                ["月度双边协商交易", "11", "321"],
+                ["交易品种", "累计合约量", "加权平均电价"],
+                ["（二）下半区块", "", ""],
+                ["不应保留", "99", "999"],
+            ]
+        )
+        diags = []
+        out = parse_shandong_table_2_medium_long_term_trade_upper_half([DummyTable(3, "表2：中长期交易情况", df)], None, "", diags)
+        self.assertEqual(len(out), 2)
+        self.assertNotIn("不应保留", " ".join(out.astype(str).values.flatten().tolist()))
+
+    def test_is_table3_continuation_page_helper(self):
+        ctx = {"inside_table3": True, "expected_cols": 6}
+        current_text = "08月25日 08月26日 08月27日 合计"
+        current_tables = [DummyTable(5, "", pd.DataFrame([["08月25日", "1", "1", "1", "1", "1"]]))]
+        self.assertTrue(is_table3_continuation_page(ctx, current_text, current_tables))
 
 
 if __name__ == "__main__":

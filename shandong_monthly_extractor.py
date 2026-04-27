@@ -467,46 +467,299 @@ def _table_to_text(table: Any) -> str:
     return normalize_shandong_text_for_regex(f"{title} {table_text}")
 
 
-def _find_table_by_keywords(tables: Sequence[Any], keywords: Sequence[str]) -> Optional[pd.DataFrame]:
+def _clean_table_cell(value: Any) -> str:
+    text = normalize_shandong_readable_text("" if value is None else str(value))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _normalize_header_text(text: str) -> str:
+    text = _clean_table_cell(text)
+    text = text.replace(" ", "")
+    return text
+
+
+def _clean_table_df(df: pd.DataFrame) -> pd.DataFrame:
+    cleaned = df.copy()
+    cleaned = cleaned.map(_clean_table_cell)
+    non_empty_rows = cleaned.apply(lambda r: any(bool(str(x).strip()) for x in r), axis=1)
+    cleaned = cleaned.loc[non_empty_rows].reset_index(drop=True)
+    non_empty_cols = [c for c in cleaned.columns if any(bool(str(v).strip()) for v in cleaned[c])]
+    if non_empty_cols:
+        cleaned = cleaned[non_empty_cols]
+    return cleaned.reset_index(drop=True)
+
+
+def _find_table_candidates_by_keywords(tables: Sequence[Any], keywords: Sequence[str]) -> List[Any]:
+    matched: List[Any] = []
     for table in tables:
         text = _table_to_text(table)
         if all(keyword in text for keyword in keywords):
-            return table.df.copy()
+            matched.append(table)
+    if matched:
+        return sorted(matched, key=lambda t: int(getattr(t, "page", 10**9)))
     for table in tables:
         text = _table_to_text(table)
         if any(keyword in text for keyword in keywords):
-            return table.df.copy()
+            matched.append(table)
+    return sorted(matched, key=lambda t: int(getattr(t, "page", 10**9)))
+
+
+def _extract_row_values(row: Sequence[Any]) -> List[str]:
+    return [_clean_table_cell(v) for v in row if _clean_table_cell(v)]
+
+
+def _detect_table2_header_row(df: pd.DataFrame) -> int:
+    for i in range(min(len(df), 8)):
+        row_text = "".join(_extract_row_values(df.iloc[i].tolist()))
+        if "交易品种" in row_text and ("合约" in row_text or "电价" in row_text):
+            return i
+    return 0
+
+
+def parse_shandong_table_2_medium_long_term_trade_upper_half(
+    table_candidates: Sequence[Any],
+    page_images: Optional[Any],
+    ocr_text: Optional[str],
+    diagnostics: List[str],
+) -> pd.DataFrame:
+    candidates = _find_table_candidates_by_keywords(table_candidates, ["表2", "中长期交易情况"])
+    if not candidates:
+        diagnostics.append("[WARN] 未找到表2：中长期交易情况")
+        return pd.DataFrame(columns=["交易品种", "累计合约量", "加权平均电价"])
+
+    selected = candidates[0]
+    diagnostics.append(f"[OK] 表2标题候选页: {getattr(selected, 'page', 'unknown')}")
+    df = _clean_table_df(selected.df)
+    if df.empty:
+        diagnostics.append("[WARN] 表2候选表为空")
+        return pd.DataFrame(columns=["交易品种", "累计合约量", "加权平均电价"])
+
+    header_idx = _detect_table2_header_row(df)
+    raw_headers = [_normalize_header_text(v) for v in df.iloc[header_idx].tolist()]
+    headers = [h if h else f"列{i+1}" for i, h in enumerate(raw_headers)]
+    data_rows: List[List[str]] = []
+    repeated_header_count = 0
+    for i in range(header_idx + 1, len(df)):
+        row = [_clean_table_cell(v) for v in df.iloc[i].tolist()]
+        row_text = "".join(x for x in row if x)
+        if not row_text or row_text.startswith("单位") or row_text.startswith("表2"):
+            continue
+        if ("（二）" in row_text or "现货" in row_text) and data_rows:
+            diagnostics.append(f"[INFO] 表2上半区截断于行{i}（疑似下半区起始）")
+            break
+        if row_text.replace(" ", "") == "".join(headers).replace(" ", ""):
+            repeated_header_count += 1
+            if repeated_header_count >= 1 and data_rows:
+                diagnostics.append(f"[INFO] 表2上半区在重复表头行{i}处停止")
+                break
+            continue
+        if any(row):
+            data_rows.append(row[: len(headers)] + [""] * max(0, len(headers) - len(row)))
+
+    out = pd.DataFrame(data_rows, columns=headers)
+    diagnostics.append(f"[OK] 表2上半区提取行数: {len(out)}")
+    return out
+
+
+def is_table3_continuation_page(previous_table_context: Dict[str, Any], current_page_text: str, current_page_tables: Sequence[Any]) -> bool:
+    if not previous_table_context.get("inside_table3"):
+        return False
+    compact_page = compact_shandong_text_for_matching(current_page_text or "")
+    if re.search(r"表[4-9]", compact_page):
+        return False
+    has_date_rows = len(re.findall(r"\d{1,2}月\d{1,2}日", compact_page)) >= 2 or ("合计" in compact_page)
+    if not has_date_rows:
+        return False
+    expected_cols = int(previous_table_context.get("expected_cols", 6))
+    compatible = False
+    for t in current_page_tables:
+        df = getattr(t, "df", None)
+        if isinstance(df, pd.DataFrame) and not df.empty and abs(df.shape[1] - expected_cols) <= 2:
+            compatible = True
+            break
+    return compatible or not current_page_tables
+
+
+def _table3_row_anchor(text: str) -> Optional[str]:
+    m = re.search(r"(\d{1,2}\s*月\s*\d{1,2}\s*日)", text)
+    if m:
+        return re.sub(r"\s+", "", m.group(1))
+    if "合计" in text:
+        return "合计"
     return None
 
 
-def parse_shandong_table_2_medium_long_term_trade(tables: Sequence[Any], diagnostics: List[str]) -> pd.DataFrame:
-    # TODO: parse detailed schema for 表2 after business rules are provided.
-    df = _find_table_by_keywords(tables, ["表2", "中长期交易情况"])
-    if df is None:
-        diagnostics.append("[WARN] 未找到表2：中长期交易情况")
-        return pd.DataFrame(columns=["raw"])
-    diagnostics.append("[OK] 检测到表2：中长期交易情况")
-    return df
+def _normalize_table3_columns(columns: Sequence[str]) -> List[str]:
+    fallback = ["日期", "发电侧日前出清电量", "用电侧日前出清电量", "日前出清均价", "发电侧实时出清电量", "实时出清均价"]
+    cleaned = [_normalize_header_text(c) for c in columns]
+    if any("日期" in c for c in cleaned):
+        return fallback
+    return fallback
 
 
-def parse_shandong_table_3_spot_trade(tables: Sequence[Any], diagnostics: List[str]) -> pd.DataFrame:
-    # TODO: parse detailed schema for 表3 after business rules are provided.
-    df = _find_table_by_keywords(tables, ["表3", "现货交易情况"])
-    if df is None:
+def parse_shandong_table_3_spot_trade_across_pages(
+    table_candidates: Sequence[Any],
+    page_images: Optional[Any],
+    ocr_text: Optional[str],
+    diagnostics: List[str],
+    report_month: Optional[str] = None,
+) -> pd.DataFrame:
+    candidates = _find_table_candidates_by_keywords(table_candidates, ["表3", "现货交易情况"])
+    if not candidates:
         diagnostics.append("[WARN] 未找到表3：现货交易情况")
-        return pd.DataFrame(columns=["raw"])
-    diagnostics.append("[OK] 检测到表3：现货交易情况")
-    return df
+        return pd.DataFrame(columns=["日期", "发电侧日前出清电量", "用电侧日前出清电量", "日前出清均价", "发电侧实时出清电量", "实时出清均价"])
+
+    title_table = candidates[0]
+    start_page = int(getattr(title_table, "page", 1))
+    diagnostics.append(f"[OK] 表3标题页: {start_page}")
+    all_sorted = sorted(table_candidates, key=lambda t: int(getattr(t, "page", 10**9)))
+    by_page: Dict[int, List[Any]] = {}
+    for t in all_sorted:
+        by_page.setdefault(int(getattr(t, "page", 0)), []).append(t)
+
+    continuation_pages: List[int] = []
+    included_tables: List[Any] = [title_table]
+    previous_ctx = {"inside_table3": True, "expected_cols": 6}
+    max_page = max(by_page.keys()) if by_page else start_page
+    for p in range(start_page + 1, max_page + 1):
+        page_tables = by_page.get(p, [])
+        page_text = " ".join(_table_to_text(t) for t in page_tables)
+        if is_table3_continuation_page(previous_ctx, page_text, page_tables):
+            continuation_pages.append(p)
+            if page_tables:
+                included_tables.extend(page_tables)
+        else:
+            if re.search(r"表[4-9]", compact_shandong_text_for_matching(page_text)):
+                break
+    if continuation_pages:
+        diagnostics.append(f"[OK] 表3续页: {continuation_pages}")
+    else:
+        diagnostics.append("[INFO] 表3未检测到续页")
+
+    normalized_cols = _normalize_table3_columns(["日期", "发电侧日前出清电量", "用电侧日前出清电量", "日前出清均价", "发电侧实时出清电量", "实时出清均价"])
+    merged_rows: Dict[str, List[str]] = {}
+    duplicate_dates: List[str] = []
+    short_rows = 0
+    for t in included_tables:
+        df = _clean_table_df(t.df)
+        if df.empty:
+            continue
+        for i in range(len(df)):
+            vals = [_clean_table_cell(v) for v in df.iloc[i].tolist()]
+            row_text = "".join(v for v in vals if v)
+            if not row_text or "单位" in row_text or "表3" in row_text or "现货交易情况" in row_text:
+                continue
+            if "日期" in row_text and "出清" in row_text:
+                continue
+            anchor = _table3_row_anchor(row_text)
+            if anchor is None:
+                if merged_rows:
+                    last_key = list(merged_rows.keys())[-1]
+                    for j, v in enumerate(vals[:6]):
+                        if v and (j >= len(merged_rows[last_key]) or not merged_rows[last_key][j]):
+                            if j >= len(merged_rows[last_key]):
+                                merged_rows[last_key].extend([""] * (j + 1 - len(merged_rows[last_key])))
+                            merged_rows[last_key][j] = v
+                continue
+            row_out = [anchor] + vals[1:6]
+            if len(vals) < 6:
+                short_rows += 1
+            row_out = row_out[:6] + [""] * max(0, 6 - len(row_out))
+            if anchor in merged_rows:
+                duplicate_dates.append(anchor)
+                base = merged_rows[anchor]
+                for j in range(1, 6):
+                    if not base[j] and row_out[j]:
+                        base[j] = row_out[j]
+            else:
+                merged_rows[anchor] = row_out
+
+    daily_keys = [k for k in merged_rows.keys() if re.match(r"\d{1,2}月\d{1,2}日", k)]
+    def _sort_key(d: str) -> int:
+        m = re.match(r"(\d{1,2})月(\d{1,2})日", d)
+        return int(m.group(2)) if m else 999
+    ordered = sorted(daily_keys, key=_sort_key)
+    final_rows = [merged_rows[k] for k in ordered]
+    if "合计" in merged_rows:
+        final_rows.append(merged_rows["合计"])
+
+    missing_dates: List[str] = []
+    if report_month:
+        y, m = report_month.split("-")
+        month = int(m)
+        if month in {1, 3, 5, 7, 8, 10, 12}:
+            days = 31
+        elif month == 2:
+            days = 29 if (int(y) % 4 == 0 and (int(y) % 100 != 0 or int(y) % 400 == 0)) else 28
+        else:
+            days = 30
+        expected = {f"{month:02d}月{d:02d}日" for d in range(1, days + 1)}
+        missing_dates = sorted(expected - set(ordered), key=_sort_key)
+    diagnostics.append(f"[OK] 表3日数据行数: {len(ordered)}")
+    diagnostics.append(f"[OK] 表3合计行: {'是' if '合计' in merged_rows else '否'}")
+    diagnostics.append(f"[INFO] 表3重复日期: {sorted(set(duplicate_dates)) if duplicate_dates else []}")
+    diagnostics.append(f"[INFO] 表3缺失日期: {missing_dates}")
+    diagnostics.append(f"[INFO] 表3列数不足行数: {short_rows}")
+
+    return pd.DataFrame(final_rows, columns=normalized_cols)
 
 
-def parse_shandong_table_8_market_operation_fee_settlement(tables: Sequence[Any], diagnostics: List[str]) -> pd.DataFrame:
-    # TODO: parse detailed schema for 表8 after business rules are provided.
-    df = _find_table_by_keywords(tables, ["表8", "市场运行费用总体结算情况"])
-    if df is None:
+def parse_shandong_table_8_market_operation_fee_settlement(
+    table_candidates: Sequence[Any],
+    page_images: Optional[Any],
+    ocr_text: Optional[str],
+    diagnostics: List[str],
+) -> pd.DataFrame:
+    candidates = _find_table_candidates_by_keywords(table_candidates, ["表8", "市场运行费用总体结算情况"])
+    if not candidates:
         diagnostics.append("[WARN] 未找到表8：市场运行费用总体结算情况")
-        return pd.DataFrame(columns=["raw"])
-    diagnostics.append("[OK] 检测到表8：市场运行费用总体结算情况")
-    return df
+        return pd.DataFrame(columns=["序号", "类别", "费用总额", "分摊返还均价", "分摊返还主体"])
+    selected = candidates[0]
+    diagnostics.append(f"[OK] 表8标题候选页: {getattr(selected, 'page', 'unknown')}")
+    df = _clean_table_df(selected.df)
+    rows: List[Dict[str, str]] = []
+    current: Optional[Dict[str, str]] = None
+    for i in range(len(df)):
+        vals = [_clean_table_cell(v) for v in df.iloc[i].tolist()]
+        row_text = "".join(v for v in vals if v)
+        if not row_text or row_text.startswith("单位") or row_text.startswith("表8"):
+            continue
+        if "序号" in row_text and "类别" in row_text:
+            continue
+        serial_match = re.match(r"^\s*(\d{1,2})\s*$", vals[0] if vals else "")
+        if serial_match:
+            if current:
+                rows.append(current)
+            current = {
+                "序号": serial_match.group(1),
+                "类别": vals[1] if len(vals) > 1 else "",
+                "费用总额": vals[2] if len(vals) > 2 else "",
+                "分摊返还均价": vals[3] if len(vals) > 3 else "",
+                "分摊返还主体": vals[4] if len(vals) > 4 else "",
+            }
+        else:
+            if current is None:
+                continue
+            tail = " ".join(v for v in vals if v)
+            if tail:
+                if len(vals) > 1 and vals[1]:
+                    current["类别"] = (current["类别"] + " " + vals[1]).strip()
+                if len(vals) > 4 and vals[4]:
+                    current["分摊返还主体"] = (current["分摊返还主体"] + " " + vals[4]).strip()
+                elif len(vals) > 2 and vals[2]:
+                    current["分摊返还主体"] = (current["分摊返还主体"] + " " + tail).strip()
+    if current:
+        rows.append(current)
+
+    out = pd.DataFrame(rows, columns=["序号", "类别", "费用总额", "分摊返还均价", "分摊返还主体"])
+    serials = [int(s) for s in out["序号"].tolist() if str(s).isdigit()]
+    missing_serials = [str(i) for i in range(1, 13) if i not in serials]
+    duplicated = sorted({s for s in serials if serials.count(s) > 1})
+    diagnostics.append(f"[OK] 表8提取行数: {len(out)}")
+    diagnostics.append(f"[INFO] 表8缺失序号: {missing_serials}")
+    diagnostics.append(f"[INFO] 表8重复序号: {duplicated}")
+    return out
 
 
 def extract_shandong_market_disclosure_monthly_report(
@@ -615,9 +868,15 @@ def extract_shandong_market_disclosure_monthly_report(
         diags.append("[WARN] 未找到章节：（二）用电侧交易结算情况")
 
     raw_tables = {
-        "山东_表2_中长期交易情况_raw": parse_shandong_table_2_medium_long_term_trade(tables, diags),
-        "山东_表3_现货交易情况_raw": parse_shandong_table_3_spot_trade(tables, diags),
-        "山东_表8_市场运行费用_raw": parse_shandong_table_8_market_operation_fee_settlement(tables, diags),
+        "山东_表2_中长期交易情况": parse_shandong_table_2_medium_long_term_trade_upper_half(
+            tables, None, normalized, diags
+        ),
+        "山东_表3_现货交易情况": parse_shandong_table_3_spot_trade_across_pages(
+            tables, None, normalized, diags, report_month=report_month
+        ),
+        "山东_表8_市场运行费用": parse_shandong_table_8_market_operation_fee_settlement(
+            tables, None, normalized, diags
+        ),
     }
 
     return ShandongExtractionResult(
