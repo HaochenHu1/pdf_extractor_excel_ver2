@@ -1,15 +1,17 @@
 import unittest
 
 import pandas as pd
+import numpy as np
 
 from shandong_monthly_extractor import (
     build_shandong_info_dataframe,
     extract_shandong_market_disclosure_monthly_report,
     is_table3_continuation_page,
     normalize_shandong_text_for_regex,
-    parse_shandong_table_2_medium_long_term_trade_upper_half,
+    parse_shandong_table_2_cumulative_trade_only,
     parse_shandong_table_3_spot_trade_across_pages,
     parse_shandong_table_8_market_operation_fee_settlement,
+    preprocess_shandong_table_image_for_watermark,
     remove_shandong_watermarks,
 )
 
@@ -144,6 +146,16 @@ class ShandongExtractorTest(unittest.TestCase):
         self.assertIn("用户侧日前申报偏差", row7["类别"])
         self.assertIn("收益回收", row7["类别"])
 
+    def test_table8_body_rows_1_to_12_present(self):
+        rows = [["序号", "类别", "费用总额", "分摊返还均价", "分摊返还主体"]]
+        for i in range(1, 13):
+            rows.append([str(i), f"类别{i}", str(i * 10), str(i), f"主体{i}"])
+        df = pd.DataFrame(rows)
+        diags = []
+        out = parse_shandong_table_8_market_operation_fee_settlement([DummyTable(8, "表8：市场运行费用总体结算情况", df)], None, "", diags)
+        serials = out["序号"].tolist()
+        self.assertEqual(serials, [str(i) for i in range(1, 13)])
+
     def test_table2_upper_half_only(self):
         df = pd.DataFrame(
             [
@@ -157,15 +169,24 @@ class ShandongExtractorTest(unittest.TestCase):
             ]
         )
         diags = []
-        out = parse_shandong_table_2_medium_long_term_trade_upper_half([DummyTable(3, "表2：中长期交易情况", df)], None, "", diags)
+        out = parse_shandong_table_2_cumulative_trade_only([DummyTable(3, "表2：中长期交易情况", df)], None, "", diags)
         self.assertEqual(len(out), 2)
         self.assertNotIn("不应保留", " ".join(out.astype(str).values.flatten().tolist()))
+        self.assertTrue(any("边界" in d or "停止" in d for d in diags))
 
     def test_is_table3_continuation_page_helper(self):
         ctx = {"inside_table3": True, "expected_cols": 6}
         current_text = "08月25日 08月26日 08月27日 合计"
         current_tables = [DummyTable(5, "", pd.DataFrame([["08月25日", "1", "1", "1", "1", "1"]]))]
         self.assertTrue(is_table3_continuation_page(ctx, current_text, current_tables))
+
+    def test_preprocess_shandong_table_image_for_watermark(self):
+        img = np.full((50, 50), 255, dtype=np.uint8)
+        img[10:12, 5:45] = 120  # dark text line
+        img[20:22, 5:45] = 190  # light watermark line
+        cleaned = preprocess_shandong_table_image_for_watermark(img)
+        self.assertLess(cleaned[10:12, 5:45].mean(), 160)  # dark text preserved
+        self.assertGreater(cleaned[20:22, 5:45].mean(), 240)  # watermark whitened
 
 
 if __name__ == "__main__":

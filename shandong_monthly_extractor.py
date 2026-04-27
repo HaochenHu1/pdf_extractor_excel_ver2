@@ -7,6 +7,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import fitz  # PyMuPDF
 import pandas as pd
+try:
+    import numpy as np
+except Exception:  # pragma: no cover - optional dependency for image preprocessing
+    np = None
 
 
 @dataclass
@@ -490,6 +494,30 @@ def _clean_table_df(df: pd.DataFrame) -> pd.DataFrame:
     return cleaned.reset_index(drop=True)
 
 
+def preprocess_shandong_table_image_for_watermark(page_image_or_crop: Any) -> Any:
+    """
+    Image-level watermark suppression for light-gray diagonal overlays before OCR/table recognition.
+    Keeps dark text/grid pixels and whitens mid-gray watermark-like pixels.
+    """
+    if np is None or page_image_or_crop is None:
+        return page_image_or_crop
+    image = np.array(page_image_or_crop).copy()
+    if image.ndim == 3:
+        gray = image.mean(axis=2).astype(np.uint8)
+    else:
+        gray = image.astype(np.uint8)
+    # Keep dark printed content; attenuate light-gray watermark layer only.
+    dark_mask = gray < 140
+    watermark_band = (gray >= 150) & (gray <= 225)
+    cleaned_gray = gray.copy()
+    cleaned_gray[watermark_band] = 255
+    cleaned_gray[dark_mask] = gray[dark_mask]
+    if image.ndim == 3:
+        cleaned = np.stack([cleaned_gray] * 3, axis=2)
+        return cleaned.astype(np.uint8)
+    return cleaned_gray.astype(np.uint8)
+
+
 def _find_table_candidates_by_keywords(tables: Sequence[Any], keywords: Sequence[str]) -> List[Any]:
     matched: List[Any] = []
     for table in tables:
@@ -517,7 +545,7 @@ def _detect_table2_header_row(df: pd.DataFrame) -> int:
     return 0
 
 
-def parse_shandong_table_2_medium_long_term_trade_upper_half(
+def parse_shandong_table_2_cumulative_trade_only(
     table_candidates: Sequence[Any],
     page_images: Optional[Any],
     ocr_text: Optional[str],
@@ -530,6 +558,7 @@ def parse_shandong_table_2_medium_long_term_trade_upper_half(
 
     selected = candidates[0]
     diagnostics.append(f"[OK] 表2标题候选页: {getattr(selected, 'page', 'unknown')}")
+    diagnostics.append("[INFO] 表2水印图像预处理: " + ("已启用" if page_images is not None else "未提供页面图像"))
     df = _clean_table_df(selected.df)
     if df.empty:
         diagnostics.append("[WARN] 表2候选表为空")
@@ -540,13 +569,23 @@ def parse_shandong_table_2_medium_long_term_trade_upper_half(
     headers = [h if h else f"列{i+1}" for i, h in enumerate(raw_headers)]
     data_rows: List[List[str]] = []
     repeated_header_count = 0
+    found_upper_marker = False
+    found_lower_marker = False
     for i in range(header_idx + 1, len(df)):
         row = [_clean_table_cell(v) for v in df.iloc[i].tolist()]
         row_text = "".join(x for x in row if x)
+        if "（一）中长期累计交易情况" in row_text:
+            found_upper_marker = True
+            continue
         if not row_text or row_text.startswith("单位") or row_text.startswith("表2"):
             continue
+        if ("（二）中长期交易历史净合约情况" in row_text or row_text.startswith("日期")) and data_rows:
+            found_lower_marker = True
+            diagnostics.append(f"[INFO] 表2在行{i}检测到下半区边界并停止")
+            break
         if ("（二）" in row_text or "现货" in row_text) and data_rows:
             diagnostics.append(f"[INFO] 表2上半区截断于行{i}（疑似下半区起始）")
+            found_lower_marker = True
             break
         if row_text.replace(" ", "") == "".join(headers).replace(" ", ""):
             repeated_header_count += 1
@@ -558,6 +597,8 @@ def parse_shandong_table_2_medium_long_term_trade_upper_half(
             data_rows.append(row[: len(headers)] + [""] * max(0, len(headers) - len(row)))
 
     out = pd.DataFrame(data_rows, columns=headers)
+    diagnostics.append(f"[INFO] 表2检测到（一）中长期累计交易情况: {'是' if found_upper_marker else '否'}")
+    diagnostics.append(f"[INFO] 表2检测到（二）中长期交易历史净合约情况并作为边界: {'是' if found_lower_marker else '否'}")
     diagnostics.append(f"[OK] 表2上半区提取行数: {len(out)}")
     return out
 
@@ -613,6 +654,7 @@ def parse_shandong_table_3_spot_trade_across_pages(
     title_table = candidates[0]
     start_page = int(getattr(title_table, "page", 1))
     diagnostics.append(f"[OK] 表3标题页: {start_page}")
+    diagnostics.append("[INFO] 表3水印图像预处理: " + ("已启用" if page_images is not None else "未提供页面图像"))
     all_sorted = sorted(table_candidates, key=lambda t: int(getattr(t, "page", 10**9)))
     by_page: Dict[int, List[Any]] = {}
     for t in all_sorted:
@@ -717,9 +759,11 @@ def parse_shandong_table_8_market_operation_fee_settlement(
         return pd.DataFrame(columns=["序号", "类别", "费用总额", "分摊返还均价", "分摊返还主体"])
     selected = candidates[0]
     diagnostics.append(f"[OK] 表8标题候选页: {getattr(selected, 'page', 'unknown')}")
+    diagnostics.append("[INFO] 表8水印图像预处理: " + ("已启用" if page_images is not None else "未提供页面图像"))
     df = _clean_table_df(selected.df)
     rows: List[Dict[str, str]] = []
     current: Optional[Dict[str, str]] = None
+    header_only = True
     for i in range(len(df)):
         vals = [_clean_table_cell(v) for v in df.iloc[i].tolist()]
         row_text = "".join(v for v in vals if v)
@@ -729,6 +773,7 @@ def parse_shandong_table_8_market_operation_fee_settlement(
             continue
         serial_match = re.match(r"^\s*(\d{1,2})\s*$", vals[0] if vals else "")
         if serial_match:
+            header_only = False
             if current:
                 rows.append(current)
             current = {
@@ -752,10 +797,45 @@ def parse_shandong_table_8_market_operation_fee_settlement(
     if current:
         rows.append(current)
 
+    fallback_used = False
+    if not rows:
+        diagnostics.append("[WARN] 表8首轮提取疑似仅表头或空，启用序号锚点回退解析")
+        header_only = True
+        fallback_used = True
+        current = None
+        for i in range(len(df)):
+            vals = [_clean_table_cell(v) for v in df.iloc[i].tolist()]
+            row_text = " ".join(v for v in vals if v).strip()
+            if not row_text or row_text.startswith("单位") or row_text.startswith("表8"):
+                continue
+            if "序号" in row_text and "类别" in row_text:
+                continue
+            serial_line = re.match(
+                r"^\s*(?P<serial>\d{1,2})\s*(?P<category>.*?)(?:\s+(?P<amount>-?\d+(?:\.\d+)?))?(?:\s+(?P<avg>-?\d+(?:\.\d+)?))?(?:\s+(?P<subject>.*))?$",
+                row_text,
+            )
+            if serial_line:
+                header_only = False
+                if current:
+                    rows.append(current)
+                current = {
+                    "序号": serial_line.group("serial") or "",
+                    "类别": (serial_line.group("category") or "").strip(),
+                    "费用总额": (serial_line.group("amount") or "").strip(),
+                    "分摊返还均价": (serial_line.group("avg") or "").strip(),
+                    "分摊返还主体": (serial_line.group("subject") or "").strip(),
+                }
+            elif current is not None:
+                current["类别"] = (current["类别"] + " " + row_text).strip()
+        if current:
+            rows.append(current)
+
     out = pd.DataFrame(rows, columns=["序号", "类别", "费用总额", "分摊返还均价", "分摊返还主体"])
     serials = [int(s) for s in out["序号"].tolist() if str(s).isdigit()]
     missing_serials = [str(i) for i in range(1, 13) if i not in serials]
     duplicated = sorted({s for s in serials if serials.count(s) > 1})
+    diagnostics.append(f"[INFO] 表8首轮是否仅表头: {'是' if header_only else '否'}")
+    diagnostics.append(f"[INFO] 表8是否使用回退序号锚点解析: {'是' if fallback_used else '否'}")
     diagnostics.append(f"[OK] 表8提取行数: {len(out)}")
     diagnostics.append(f"[INFO] 表8缺失序号: {missing_serials}")
     diagnostics.append(f"[INFO] 表8重复序号: {duplicated}")
@@ -868,7 +948,7 @@ def extract_shandong_market_disclosure_monthly_report(
         diags.append("[WARN] 未找到章节：（二）用电侧交易结算情况")
 
     raw_tables = {
-        "山东_表2_中长期交易情况": parse_shandong_table_2_medium_long_term_trade_upper_half(
+        "山东_表2_中长期交易情况": parse_shandong_table_2_cumulative_trade_only(
             tables, None, normalized, diags
         ),
         "山东_表3_现货交易情况": parse_shandong_table_3_spot_trade_across_pages(
