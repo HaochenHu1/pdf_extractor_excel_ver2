@@ -163,8 +163,8 @@ class ShandongExtractorTest(unittest.TestCase):
                 ["交易品种", "累计合约量", "加权平均电价"],
                 ["年度双边协商交易", "10", "320"],
                 ["月度双边协商交易", "11", "321"],
-                ["交易品种", "累计合约量", "加权平均电价"],
-                ["（二）下半区块", "", ""],
+                ["（二）中长期交易历史净合约情况", "", ""],
+                ["日期", "双边协商交易", "合计"],
                 ["不应保留", "99", "999"],
             ]
         )
@@ -187,6 +187,19 @@ class ShandongExtractorTest(unittest.TestCase):
         cleaned = preprocess_shandong_table_image_for_watermark(img)
         self.assertLess(cleaned[10:12, 5:45].mean(), 160)  # dark text preserved
         self.assertGreater(cleaned[20:22, 5:45].mean(), 240)  # watermark whitened
+
+    def test_watermark_tokens_removed_from_table_cells(self):
+        df = pd.DataFrame(
+            [
+                ["交易品种", "累计合约量", "加权平均电价"],
+                ["年度双边协商交易 晶科慧能", "10", "320 2025年9月24日16:36:20"],
+            ]
+        )
+        diags = []
+        out = parse_shandong_table_2_cumulative_trade_only([DummyTable(3, "表2：中长期交易情况", df)], None, "", diags)
+        flat = " ".join(out.astype(str).values.flatten().tolist())
+        self.assertNotIn("晶科慧能", flat)
+        self.assertNotIn("16:36:20", flat)
 
 
 if __name__ == "__main__":

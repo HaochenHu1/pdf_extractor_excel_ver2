@@ -473,6 +473,10 @@ def _table_to_text(table: Any) -> str:
 
 def _clean_table_cell(value: Any) -> str:
     text = normalize_shandong_readable_text("" if value is None else str(value))
+    # Remove watermark fragments that leak into OCR/table cells.
+    text = re.sub(r"晶科慧能", "", text)
+    text = re.sub(r"20\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*\d{1,2}\s*[:：]\s*\d{1,2}\s*[:：]\s*\d{1,2}", "", text)
+    text = re.sub(r"\b20\d{2}[/-]\d{1,2}[/-]\d{1,2}\s+\d{1,2}[:：]\d{1,2}[:：]\d{1,2}\b", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -574,12 +578,18 @@ def parse_shandong_table_2_cumulative_trade_only(
     for i in range(header_idx + 1, len(df)):
         row = [_clean_table_cell(v) for v in df.iloc[i].tolist()]
         row_text = "".join(x for x in row if x)
-        if "（一）中长期累计交易情况" in row_text:
+        row_compact = compact_shandong_text_for_matching(row_text)
+        if "（一）中长期累计交易情况" in row_text or "(一)中长期累计交易情况" in row_text or "一中长期累计交易情况" in row_compact:
             found_upper_marker = True
             continue
         if not row_text or row_text.startswith("单位") or row_text.startswith("表2"):
             continue
-        if ("（二）中长期交易历史净合约情况" in row_text or row_text.startswith("日期")) and data_rows:
+        if (
+            "（二）中长期交易历史净合约情况" in row_text
+            or "(二)中长期交易历史净合约情况" in row_text
+            or "二中长期交易历史净合约情况" in row_compact
+            or row_compact.startswith("日期")
+        ) and data_rows:
             found_lower_marker = True
             diagnostics.append(f"[INFO] 表2在行{i}检测到下半区边界并停止")
             break
@@ -772,6 +782,7 @@ def parse_shandong_table_8_market_operation_fee_settlement(
         if "序号" in row_text and "类别" in row_text:
             continue
         serial_match = re.match(r"^\s*(\d{1,2})\s*$", vals[0] if vals else "")
+        serial_with_text = re.match(r"^\s*(\d{1,2})\s*(.+)$", vals[0] if vals else "")
         if serial_match:
             header_only = False
             if current:
@@ -782,6 +793,17 @@ def parse_shandong_table_8_market_operation_fee_settlement(
                 "费用总额": vals[2] if len(vals) > 2 else "",
                 "分摊返还均价": vals[3] if len(vals) > 3 else "",
                 "分摊返还主体": vals[4] if len(vals) > 4 else "",
+            }
+        elif serial_with_text:
+            header_only = False
+            if current:
+                rows.append(current)
+            current = {
+                "序号": serial_with_text.group(1),
+                "类别": serial_with_text.group(2).strip(),
+                "费用总额": vals[1] if len(vals) > 1 else "",
+                "分摊返还均价": vals[2] if len(vals) > 2 else "",
+                "分摊返还主体": vals[3] if len(vals) > 3 else "",
             }
         else:
             if current is None:
