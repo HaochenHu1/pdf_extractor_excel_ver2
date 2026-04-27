@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import pandas as pd
 import fitz  # PyMuPDF
+import pandas as pd
 
 
 @dataclass
@@ -17,13 +17,15 @@ class ShandongExtractionResult:
     report_month: Optional[str]
 
 
-def normalize_cn_text(text: str) -> str:
-    text = text.replace("\u3000", " ").replace("\xa0", " ")
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"[（(]", "（", text)
-    text = re.sub(r"[）)]", "）", text)
-    text = re.sub(r"[：:]", "：", text)
-    return text.strip()
+SECTION_COLUMN_MAPPING = {
+    "报告月份": "报告月份",
+    "section": "一级章节",
+    "subsection": "二级章节",
+    "field": "指标名称",
+    "value": "数值",
+    "unit": "单位",
+    "notes": "备注",
+}
 
 
 def parse_report_month_from_filename(filename: str) -> Optional[str]:
@@ -33,58 +35,161 @@ def parse_report_month_from_filename(filename: str) -> Optional[str]:
         return None
     year = int(m.group("y"))
     month = int(m.group("m"))
-    if month < 1 or month > 12:
+    if not (1 <= month <= 12):
         return None
     return f"{year:04d}-{month:02d}"
 
 
+def remove_shandong_watermarks(text: str) -> str:
+    # 晶科慧能 2025年8月12日 10:35:27 / 10：35：27, tolerate spaces/newlines.
+    pattern = re.compile(
+        r"晶科慧能\s*"
+        r"\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*"
+        r"(?:\n|\r|\s)*"
+        r"\d{1,2}\s*[：:]\s*\d{1,2}\s*[：:]\s*\d{1,2}",
+        re.IGNORECASE,
+    )
+    return pattern.sub(" ", text)
+
+
+def normalize_shandong_text_for_regex(text: str) -> str:
+    text = remove_shandong_watermarks(text)
+    text = text.replace("\u3000", " ").replace("\xa0", " ")
+    text = text.replace("（", "(").replace("）", ")")
+    text = text.replace("：", ":").replace("％", "%")
+    text = text.replace("．", ".")
+    # remove footnote markers immediately before digits
+    text = re.sub(r"[①②③④⑤⑥⑦⑧⑨]\s*(?=\d)", "", text)
+    text = re.sub(r"(?:\(|（|\[)\s*[1-9]\s*(?:\)|）|\])\s*(?=\d)", "", text)
+    text = re.sub(r"(?:注|脚注)\s*[1-9]\s*(?=\d)", "", text)
+
+    # join OCR line breaks and repeated spaces
+    text = re.sub(r"[\r\n]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+
+    # remove spaces inside numeric tokens / number+unit
+    text = re.sub(r"(?<=\d)\s+(?=\d)", "", text)
+    text = re.sub(r"(?<=\d)\s+(?=[.])", "", text)
+    text = re.sub(r"(?<=\.)\s+(?=\d)", "", text)
+    text = re.sub(r"(?<=\d)\s+(?=(?:亿千瓦时|万千瓦时|万千瓦|元/兆瓦时|%))", "", text)
+
+    return text.strip()
+
+
 def _heading_pattern(heading: str) -> re.Pattern[str]:
-    compact = re.sub(r"\s+", "", heading)
-    # allow optional OCR spaces between chars
-    pattern = r"\s*".join(re.escape(ch) for ch in compact)
+    normalized_heading = normalize_shandong_text_for_regex(heading)
+    normalized_heading = re.sub(r"\s+", "", normalized_heading)
+    pattern = r"\s*".join(re.escape(ch) for ch in normalized_heading)
     return re.compile(pattern)
 
 
 def slice_section(text: str, start_heading: str, end_heading_candidates: Sequence[str]) -> str:
-    normalized = normalize_cn_text(text)
-    start_re = _heading_pattern(start_heading)
-    start_match = start_re.search(normalized)
+    start_match = _heading_pattern(start_heading).search(text)
     if not start_match:
         return ""
     start = start_match.end()
-    end = len(normalized)
-    for cand in end_heading_candidates:
-        end_re = _heading_pattern(cand)
-        m = end_re.search(normalized, pos=start)
+    end = len(text)
+    for candidate in end_heading_candidates:
+        m = _heading_pattern(candidate).search(text, pos=start)
         if m:
             end = min(end, m.start())
-    return normalized[start:end].strip()
+    return text[start:end].strip()
 
 
-def _extract_by_regex(text: str, patterns: Sequence[str]) -> Tuple[Optional[str], Optional[str]]:
-    for p in patterns:
-        m = re.search(p, text)
-        if m:
-            return m.group("value"), (m.groupdict().get("unit") or "").strip() or None
-    return None, None
+def _field_range(field_name: Optional[str], unit: Optional[str]) -> Optional[Tuple[float, float]]:
+    key = (field_name or "", unit or "")
+    ranges = {
+        ("全省发电装机总容量", "万千瓦"): (1000.0, 50000.0),
+        ("水电装机容量", "万千瓦"): (0.0, 20000.0),
+        ("核电装机容量", "万千瓦"): (0.0, 15000.0),
+        ("火电装机容量", "万千瓦"): (0.0, 40000.0),
+        ("风电装机容量", "万千瓦"): (0.0, 30000.0),
+        ("太阳能发电装机容量", "万千瓦"): (0.0, 40000.0),
+    }
+    return ranges.get(key)
 
 
-def extract_number_near_label(section_text: str, label_patterns: Sequence[str], unit_patterns: Sequence[str]) -> Tuple[Optional[str], Optional[str]]:
+def clean_shandong_numeric_value(
+    raw_value: Optional[str],
+    field_name: Optional[str] = None,
+    unit: Optional[str] = None,
+    context_text: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    if raw_value is None:
+        return None, None
+    cleaned = raw_value.replace(",", "").strip()
+    if not re.fullmatch(r"[+-]?\d+(?:\.\d+)?", cleaned):
+        return raw_value, "数值格式异常，保留原值"
+
+    range_hint = _field_range(field_name, unit)
+    raw_float = float(cleaned)
+    note: Optional[str] = None
+
+    # Footnote-merged digit correction, conservative.
+    if (
+        cleaned[0] in {"1", "2", "3"}
+        and len(cleaned.replace(".", "")) >= 6
+        and field_name is not None
+        and (field_name in (context_text or "") or (unit and unit in (context_text or "")))
+    ):
+        candidate = cleaned[1:]
+        if candidate and re.fullmatch(r"\d+(?:\.\d+)?", candidate):
+            cand_float = float(candidate)
+            if range_hint:
+                raw_in_range = range_hint[0] <= raw_float <= range_hint[1]
+                cand_in_range = range_hint[0] <= cand_float <= range_hint[1]
+                if (not raw_in_range) and cand_in_range:
+                    note = f"疑似脚注数字并入数值，原始识别值为{cleaned}，已修正为{candidate}"
+                    return candidate, note
+                if raw_in_range and not cand_in_range:
+                    return cleaned, None
+            else:
+                # no range hint: avoid silent aggressive changes
+                if raw_float >= 10 * cand_float:
+                    return cleaned, f"疑似脚注数字并入数值，候选修正值{candidate}未自动应用"
+
+    if range_hint and not (range_hint[0] <= raw_float <= range_hint[1]):
+        note = f"数值{cleaned}{unit or ''}超出经验范围{range_hint[0]}~{range_hint[1]}"
+    return cleaned, note
+
+
+def _extract_number_near_label(
+    section_text: str,
+    field_name: str,
+    label_patterns: Sequence[str],
+    unit_patterns: Sequence[str],
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     label_part = "(?:" + "|".join(label_patterns) + ")"
     unit_part = "(?:" + "|".join(unit_patterns) + ")"
     patterns = [
-        rf"{label_part}[^。；;，,\n]{{0,40}}?(?P<value>[+-]?\d+(?:\.\d+)?)\s*(?P<unit>{unit_part})",
-        rf"(?P<value>[+-]?\d+(?:\.\d+)?)\s*(?P<unit>{unit_part})[^。；;，,\n]{{0,20}}?{label_part}",
+        rf"{label_part}[\s\S]{{0,120}}?(?P<value>[+-]?\d+(?:\.\d+)?)\s*(?P<unit>{unit_part})",
+        rf"(?P<value>[+-]?\d+(?:\.\d+)?)\s*(?P<unit>{unit_part})[\s\S]{{0,80}}?{label_part}",
     ]
-    return _extract_by_regex(section_text, patterns)
+    for pattern in patterns:
+        m = re.search(pattern, section_text)
+        if not m:
+            continue
+        raw_value = m.group("value")
+        unit = m.group("unit")
+        cleaned, note = clean_shandong_numeric_value(raw_value, field_name=field_name, unit=unit, context_text=section_text)
+        return cleaned, unit, note
+    return None, None, None
 
 
-def extract_percent_near_label(section_text: str, label_patterns: Sequence[str]) -> Tuple[Optional[str], Optional[str]]:
-    return extract_number_near_label(section_text, label_patterns, [r"%", r"％"])
+def _extract_percent_near_label(section_text: str, field_name: str, label_patterns: Sequence[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    return _extract_number_near_label(section_text, field_name, label_patterns, [r"%"])
 
 
-def _add_row(rows: List[Dict[str, Any]], report_month: Optional[str], section: str, subsection: str, field: str,
-             value: Optional[str], unit: Optional[str], source_text: str, notes: str = "") -> None:
+def _add_row(
+    rows: List[Dict[str, Any]],
+    report_month: Optional[str],
+    section: str,
+    subsection: str,
+    field: str,
+    value: Optional[str],
+    unit: Optional[str],
+    notes: str = "",
+) -> None:
     rows.append(
         {
             "报告月份": report_month,
@@ -93,206 +198,141 @@ def _add_row(rows: List[Dict[str, Any]], report_month: Optional[str], section: s
             "field": field,
             "value": value,
             "unit": unit,
-            "source_text": source_text[:500],
             "notes": notes,
         }
     )
 
 
-def parse_shandong_power_consumption(section_text: str, report_month: Optional[str]) -> Tuple[List[Dict[str, Any]], List[str]]:
+def build_shandong_info_dataframe(info_rows: Sequence[Dict[str, Any]]) -> pd.DataFrame:
+    base = pd.DataFrame(info_rows)
+    if base.empty:
+        base = pd.DataFrame(columns=list(SECTION_COLUMN_MAPPING.keys()))
+    for c in SECTION_COLUMN_MAPPING.keys():
+        if c not in base.columns:
+            base[c] = None
+    return base[list(SECTION_COLUMN_MAPPING.keys())].rename(columns=SECTION_COLUMN_MAPPING)
+
+
+def _extract_fields(
+    section_text: str,
+    report_month: Optional[str],
+    section_name: str,
+    subsection_name: str,
+    cfg: Sequence[Tuple[str, Sequence[str], Sequence[str], bool]],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
     rows: List[Dict[str, Any]] = []
     warnings: List[str] = []
-    # Industry-specific paragraph patterns are more stable than generic nearby-label matching.
-    industry_patterns = {
-        "第一产业": re.search(
-            r"第一产业.{0,80}?用电量.{0,20}?(?P<value>[+-]?\d+(?:\.\d+)?)\s*(?P<unit>亿千瓦时|万千瓦时).{0,80}?同比(?:增长)?.{0,20}?(?P<yoy>[+-]?\d+(?:\.\d+)?)\s*[%％]",
-            section_text,
-        ),
-        "第二产业": re.search(
-            r"第二产业.{0,80}?用电量.{0,20}?(?P<value>[+-]?\d+(?:\.\d+)?)\s*(?P<unit>亿千瓦时|万千瓦时).{0,80}?同比(?:增长)?.{0,20}?(?P<yoy>[+-]?\d+(?:\.\d+)?)\s*[%％]",
-            section_text,
-        ),
-        "第三产业": re.search(
-            r"第三产业.{0,80}?用电量.{0,20}?(?P<value>[+-]?\d+(?:\.\d+)?)\s*(?P<unit>亿千瓦时|万千瓦时).{0,80}?同比(?:增长)?.{0,20}?(?P<yoy>[+-]?\d+(?:\.\d+)?)\s*[%％]",
-            section_text,
-        ),
-    }
-    for industry, m in industry_patterns.items():
-        v = m.group("value") if m else None
-        u = m.group("unit") if m else None
-        yoy = m.group("yoy") if m else None
-        _add_row(rows, report_month, "一、电网概览", "（一）全省全社会用电情况", f"{industry}用电量", v, u, section_text, "" if v else "missing")
-        _add_row(rows, report_month, "一、电网概览", "（一）全省全社会用电情况", f"{industry}同比增长", yoy, "%" if yoy else None, section_text, "" if yoy else "missing")
-        if v is None:
-            warnings.append(f"未提取到{industry}用电量")
-        if yoy is None:
-            warnings.append(f"未提取到{industry}同比增长")
-
-    mappings = [
-        ("第一产业用电量", [r"第一产业(?:用电量)?"], [r"亿千瓦时", r"万千瓦时"]),
-        ("第二产业用电量", [r"第二产业(?:用电量)?"], [r"亿千瓦时", r"万千瓦时"]),
-        ("第三产业用电量", [r"第三产业(?:用电量)?"], [r"亿千瓦时", r"万千瓦时"]),
-        ("全社会用电量", [r"全社会用电量"], [r"亿千瓦时", r"万千瓦时"]),
-        ("城乡居民生活用电量", [r"城乡居民生活用电量"], [r"亿千瓦时", r"万千瓦时"]),
-    ]
-    for field, labels, units in mappings:
-        if any(r["field"] == field and r["value"] is not None for r in rows):
-            continue
-        v, u = extract_number_near_label(section_text, labels, units)
-        _add_row(rows, report_month, "一、电网概览", "（一）全省全社会用电情况", field, v, u, section_text,
-                 "" if v is not None else "missing")
-        if v is None:
+    for field, labels, units, is_percent in cfg:
+        if is_percent:
+            value, unit, note = _extract_percent_near_label(section_text, field, labels)
+            if value is not None:
+                unit = "%"
+        else:
+            value, unit, note = _extract_number_near_label(section_text, field, labels, units)
+        notes = note or ("missing" if value is None else "")
+        _add_row(rows, report_month, section_name, subsection_name, field, value, unit, notes)
+        if value is None:
             warnings.append(f"未提取到{field}")
+        elif note:
+            warnings.append(note)
     return rows, warnings
+
+
+def parse_shandong_power_consumption(section_text: str, report_month: Optional[str]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    cfg = [
+        ("第一产业用电量", [r"第一产业(?:用电量)?"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("第一产业同比增长", [r"第一产业[\s\S]{0,40}?同比(?:增长)?"], [r"%"], True),
+        ("第二产业用电量", [r"第二产业(?:用电量)?"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("第二产业同比增长", [r"第二产业[\s\S]{0,40}?同比(?:增长)?"], [r"%"], True),
+        ("第三产业用电量", [r"第三产业(?:用电量)?"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("第三产业同比增长", [r"第三产业[\s\S]{0,40}?同比(?:增长)?"], [r"%"], True),
+        ("全社会用电量", [r"全社会用电量"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("城乡居民生活用电量", [r"城乡居民生活用电量"], [r"亿千瓦时", r"万千瓦时"], False),
+    ]
+    return _extract_fields(section_text, report_month, "一、电网概览", "（一）全省全社会用电情况", cfg)
 
 
 def parse_shandong_capacity_and_generation(section_text: str, report_month: Optional[str]) -> Tuple[List[Dict[str, Any]], List[str]]:
-    rows: List[Dict[str, Any]] = []
-    warnings: List[str] = []
     cfg = [
-        ("全省发电装机总容量", [r"全省发电装机总容量|全省发电装机容量|全省装机总容量"], [r"万千瓦"]),
-        ("水电装机容量", [r"水电装机(?:容量)?|水电"], [r"万千瓦"]),
-        ("核电装机容量", [r"核电装机(?:容量)?|核电"], [r"万千瓦"]),
-        ("火电装机容量", [r"火电装机(?:容量)?|火电"], [r"万千瓦"]),
-        ("风电装机容量", [r"风电装机(?:容量)?|风电"], [r"万千瓦"]),
-        ("太阳能发电装机容量", [r"太阳能发电装机(?:容量)?|光伏装机(?:容量)?"], [r"万千瓦"]),
-        ("全省发电量", [r"全省发电量"], [r"亿千瓦时", r"万千瓦时"]),
-        ("水电发电量", [r"水电发电量|水电"], [r"亿千瓦时", r"万千瓦时"]),
-        ("火电发电量", [r"火电发电量|火电"], [r"亿千瓦时", r"万千瓦时"]),
-        ("核电发电量", [r"核电发电量|核电"], [r"亿千瓦时", r"万千瓦时"]),
-        ("风电发电量", [r"风电发电量|风电"], [r"亿千瓦时", r"万千瓦时"]),
-        ("太阳能发电量", [r"太阳能发电量|光伏发电量|太阳能发电"], [r"亿千瓦时", r"万千瓦时"]),
+        ("全省发电装机总容量", [r"全省发电装机总容量|全省发电装机容量|全省装机总容量"], [r"万千瓦"], False),
+        ("水电装机容量", [r"水电装机(?:容量)?|水电"], [r"万千瓦"], False),
+        ("核电装机容量", [r"核电装机(?:容量)?|核电"], [r"万千瓦"], False),
+        ("火电装机容量", [r"火电装机(?:容量)?|火电"], [r"万千瓦"], False),
+        ("风电装机容量", [r"风电装机(?:容量)?|风电"], [r"万千瓦"], False),
+        ("太阳能发电装机容量", [r"太阳能发电装机(?:容量)?|光伏装机(?:容量)?"], [r"万千瓦"], False),
+        ("全省发电量", [r"全省发电量"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("水电发电量", [r"水电发电量|水电"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("火电发电量", [r"火电发电量|火电"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("核电发电量", [r"核电发电量|核电"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("风电发电量", [r"风电发电量|风电"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("太阳能发电量", [r"太阳能发电量|光伏发电量|太阳能发电"], [r"亿千瓦时", r"万千瓦时"], False),
     ]
-    for field, labels, units in cfg:
-        v, u = extract_number_near_label(section_text, labels, units)
-        _add_row(rows, report_month, "一、电网概览", "（二）全省发电机组装机及发电总体情况", field, v, u, section_text,
-                 "" if v is not None else "missing")
-        if v is None:
-            warnings.append(f"未提取到{field}")
-    return rows, warnings
+    return _extract_fields(section_text, report_month, "一、电网概览", "（二）全省发电机组装机及发电总体情况", cfg)
 
 
 def parse_shandong_green_power_trade(section_text: str, report_month: Optional[str]) -> Tuple[List[Dict[str, Any]], List[str]]:
-    rows: List[Dict[str, Any]] = []
-    warnings: List[str] = []
     cfg = [
-        ("省内绿电交易次数", [r"省内绿电交易|组织"], [r"次"]),
-        ("新能源场站数量", [r"新能源场站"], [r"家"]),
-        ("售电公司数量", [r"售电公司"], [r"家"]),
-        ("申报电量", [r"申报电量|交易电量"], [r"亿千瓦时", r"万千瓦时"]),
-        ("成交电量", [r"成交电量|成交"], [r"亿千瓦时", r"万千瓦时"]),
-        ("环境溢价", [r"环境溢价"], [r"元/兆瓦时"]),
+        ("省内绿电交易次数", [r"省内绿电交易|组织"], [r"次"], False),
+        ("新能源场站数量", [r"新能源场站"], [r"家"], False),
+        ("售电公司数量", [r"售电公司"], [r"家"], False),
+        ("申报电量", [r"申报电量|交易电量"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("成交电量", [r"成交电量|成交"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("环境溢价", [r"环境溢价"], [r"元/兆瓦时"], False),
     ]
-    for field, labels, units in cfg:
-        v, u = extract_number_near_label(section_text, labels, units)
-        _add_row(rows, report_month, "四、交易组织情况", "（三）绿电交易组织情况", field, v, u, section_text,
-                 "" if v is not None else "missing")
-        if v is None:
-            warnings.append(f"未提取到{field}")
-    return rows, warnings
+    return _extract_fields(section_text, report_month, "四、交易组织情况", "（三）绿电交易组织情况", cfg)
 
 
 def parse_shandong_generation_side_settlement(section_text: str, report_month: Optional[str]) -> Tuple[List[Dict[str, Any]], List[str]]:
-    rows: List[Dict[str, Any]] = []
-    warnings: List[str] = []
     cfg = [
-        ("省内发电侧共结算上网电量", [r"省内发电侧共结算上网电量|发电侧共结算上网电量"], [r"亿千瓦时", r"万千瓦时"], "（一）发电侧交易结算情况"),
-        ("合约电量", [r"合约电量"], [r"亿千瓦时", r"万千瓦时"], "（一）发电侧交易结算情况"),
-        ("跨省跨区交易结算电量", [r"跨省跨区交易结算电量"], [r"亿千瓦时", r"万千瓦时"], "2. 跨省跨区交易结算情况"),
-        ("富余新能源外送电量", [r"富余新能源外送电量"], [r"万千瓦时", r"亿千瓦时"], "2. 跨省跨区交易结算情况"),
+        ("省内发电侧共结算上网电量", [r"省内发电侧共结算上网电量|发电侧共结算上网电量"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("合约电量", [r"合约电量"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("跨省跨区交易结算电量", [r"跨省跨区交易结算电量"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("富余新能源外送电量", [r"富余新能源外送电量"], [r"万千瓦时", r"亿千瓦时"], False),
     ]
-    for field, labels, units, subsection in cfg:
-        if any(r["field"] == field and r["value"] is not None for r in rows):
-            continue
-        v, u = extract_number_near_label(section_text, labels, units)
-        _add_row(rows, report_month, "五、市场结算情况", subsection, field, v, u, section_text, "" if v is not None else "missing")
-        if v is None:
-            warnings.append(f"未提取到{field}")
-    return rows, warnings
+    return _extract_fields(section_text, report_month, "五、市场结算情况", "（一）发电侧交易结算情况", cfg)
 
 
 def parse_shandong_user_side_settlement(section_text: str, report_month: Optional[str]) -> Tuple[List[Dict[str, Any]], List[str]]:
     rows: List[Dict[str, Any]] = []
     warnings: List[str] = []
-    month_v, _ = _extract_by_regex(section_text, [r"(?P<value>\d{1,2})\s*月(?:份)?"])
-    _add_row(rows, report_month, "五、市场结算情况", "2. 零售侧结算情况", "月份", month_v, "月" if month_v else None, section_text, "" if month_v else "missing")
-    user_count = _extract_by_regex(section_text, [r"(?P<value>\d+(?:\.\d+)?)\s*家零售用户"])[0]
-    retailer_count = _extract_by_regex(section_text, [r"(?P<value>\d+(?:\.\d+)?)\s*家售电公司"])[0]
-    vpp_count = _extract_by_regex(section_text, [r"(?P<value>\d+(?:\.\d+)?)\s*家虚拟电厂"])[0]
-    _add_row(rows, report_month, "五、市场结算情况", "2. 零售侧结算情况", "零售用户数量", user_count, "家" if user_count else None, section_text, "" if user_count else "missing")
-    _add_row(rows, report_month, "五、市场结算情况", "2. 零售侧结算情况", "售电公司数量", retailer_count, "家" if retailer_count else None, section_text, "" if retailer_count else "missing")
-    _add_row(rows, report_month, "五、市场结算情况", "2. 零售侧结算情况", "虚拟电厂数量", vpp_count, "家" if vpp_count else None, section_text, "" if vpp_count else "missing")
-    retail_energy = re.search(
-        r"零售合同.{0,30}?结算电量\s*(?P<value>[+-]?\d+(?:\.\d+)?)\s*(?P<unit>亿千瓦时|万千瓦时)",
-        section_text,
-    )
-    retail_price = re.search(
-        r"结算均价(?:（[^）]{0,100}）)?\s*(?P<value>[+-]?\d+(?:\.\d+)?)\s*(?P<unit>元/兆瓦时)",
-        section_text,
-    )
-    _add_row(
-        rows,
-        report_month,
-        "五、市场结算情况",
-        "2. 零售侧结算情况",
-        "线上签订零售合同结算电量",
-        retail_energy.group("value") if retail_energy else None,
-        retail_energy.group("unit") if retail_energy else None,
-        section_text,
-        "" if retail_energy else "missing",
-    )
-    _add_row(
-        rows,
-        report_month,
-        "五、市场结算情况",
-        "2. 零售侧结算情况",
-        "结算均价",
-        retail_price.group("value") if retail_price else None,
-        retail_price.group("unit") if retail_price else None,
-        section_text,
-        "" if retail_price else "missing",
-    )
+
+    month_value = re.search(r"(?P<value>\d{1,2})月(?:份)?", section_text)
+    _add_row(rows, report_month, "五、市场结算情况", "2. 零售侧结算情况", "月份", month_value.group("value") if month_value else None, "月" if month_value else None, "" if month_value else "missing")
 
     cfg = [
-        ("用电批发侧总结算电量", [r"用电批发侧总?结算电量|批发侧结算总体情况"], [r"亿千瓦时", r"万千瓦时"], "1. 批发侧结算总体情况"),
+        ("用电批发侧总结算电量", [r"用电批发侧总?结算电量|批发侧结算总体情况"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("零售用户数量", [r"零售用户"], [r"家"], False),
+        ("售电公司数量", [r"售电公司"], [r"家"], False),
+        ("虚拟电厂数量", [r"虚拟电厂"], [r"家"], False),
+        ("线上签订零售合同结算电量", [r"零售合同[\s\S]{0,50}?结算电量"], [r"亿千瓦时", r"万千瓦时"], False),
+        ("结算均价", [r"结算均价(?:\([^\)]{0,100}\))?"], [r"元/兆瓦时"], False),
     ]
-    for field, labels, units, subsection in cfg:
-        v, u = extract_number_near_label(section_text, labels, units)
-        _add_row(rows, report_month, "五、市场结算情况", subsection, field, v, u, section_text, "" if v is not None else "missing")
-        if v is None:
-            warnings.append(f"未提取到{field}")
-    if month_v is None:
+    parsed, warns = _extract_fields(section_text, report_month, "五、市场结算情况", "（二）用电侧交易结算情况", cfg)
+    rows.extend(parsed)
+    warnings.extend(warns)
+
+    if month_value is None:
         warnings.append("未提取到月份")
-    if user_count is None:
-        warnings.append("未提取到零售用户数量")
-    if retailer_count is None:
-        warnings.append("未提取到售电公司数量")
-    if vpp_count is None:
-        warnings.append("未提取到虚拟电厂数量")
-    if retail_energy is None:
-        warnings.append("未提取到线上签订零售合同结算电量")
-    if retail_price is None:
-        warnings.append("未提取到结算均价")
     return rows, warnings
 
 
 def _table_to_text(table: Any) -> str:
-    title = (getattr(table, "title", None) or "")
+    title = getattr(table, "title", None) or ""
     df = getattr(table, "df", None)
     table_text = ""
     if isinstance(df, pd.DataFrame) and not df.empty:
         table_text = " ".join(df.fillna("").astype(str).values.flatten().tolist())
-    return normalize_cn_text(f"{title} {table_text}")
+    return normalize_shandong_text_for_regex(f"{title} {table_text}")
 
 
 def _find_table_by_keywords(tables: Sequence[Any], keywords: Sequence[str]) -> Optional[pd.DataFrame]:
     for table in tables:
-        txt = _table_to_text(table)
-        if all(k in txt for k in keywords):
+        text = _table_to_text(table)
+        if all(keyword in text for keyword in keywords):
             return table.df.copy()
     for table in tables:
-        txt = _table_to_text(table)
-        if any(k in txt for k in keywords):
+        text = _table_to_text(table)
+        if any(keyword in text for keyword in keywords):
             return table.df.copy()
     return None
 
@@ -335,13 +375,14 @@ def extract_shandong_market_disclosure_monthly_report(
     diagnostics: Optional[List[str]] = None,
 ) -> ShandongExtractionResult:
     diags = diagnostics if diagnostics is not None else []
+
     raw_text = text
     if raw_text is None:
         doc = fitz.open(pdf_path)
         raw_text = "\n".join((page.get_text("text") or "") for page in doc)
         doc.close()
 
-    normalized = normalize_cn_text(raw_text)
+    normalized = normalize_shandong_text_for_regex(raw_text)
     report_month = parse_report_month_from_filename(Path(pdf_path).name)
     if report_month is None:
         diags.append("[WARN] 文件名未解析出报告月份")
@@ -359,7 +400,7 @@ def extract_shandong_market_disclosure_monthly_report(
     else:
         diags.append("[WARN] 未找到章节：（一）全省全社会用电情况")
 
-    cap_gen_sec = slice_section(normalized, "（二）全省发电机组装机及发电总体情况", ["二、", "三、", "四、交易组织情况"])
+    cap_gen_sec = slice_section(normalized, "（二）全省发电机组装机及发电总体情况", ["三、", "四、交易组织情况"])
     if cap_gen_sec:
         parsed, warns = parse_shandong_capacity_and_generation(cap_gen_sec, report_month)
         rows.extend(parsed)

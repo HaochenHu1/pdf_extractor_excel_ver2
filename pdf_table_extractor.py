@@ -21,6 +21,7 @@ from paragraph_metric_extractor import (
 )
 from shandong_monthly_extractor import (
     ShandongExtractionResult,
+    build_shandong_info_dataframe,
     extract_shandong_market_disclosure_monthly_report,
 )
 
@@ -2167,14 +2168,7 @@ def write_shandong_excel(
     shandong_result: ShandongExtractionResult,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    info_df = pd.DataFrame(
-        shandong_result.info_rows,
-        columns=["报告月份", "section", "subsection", "field", "value", "unit", "source_text", "notes"],
-    )
-    if info_df.empty:
-        info_df = pd.DataFrame(
-            columns=["报告月份", "section", "subsection", "field", "value", "unit", "source_text", "notes"]
-        )
+    info_df = build_shandong_info_dataframe(shandong_result.info_rows)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         info_df.to_excel(writer, index=False, sheet_name="山东_信息汇总")
         for sheet_name in ["山东_表2_中长期交易情况_raw", "山东_表3_现货交易情况_raw", "山东_表8_市场运行费用_raw"]:
