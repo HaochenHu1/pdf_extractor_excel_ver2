@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import re
 import subprocess
 import sys
 from collections import Counter
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -18,6 +20,11 @@ from paragraph_metric_extractor import (
     default_section_configs,
     demo_extract_market_section_metrics,
     extract_configured_sections_from_pdf,
+)
+from shandong_monthly_extractor import (
+    ShandongExtractionResult,
+    build_shandong_info_dataframe,
+    extract_shandong_market_disclosure_monthly_report,
 )
 
 @dataclass
@@ -2154,6 +2161,80 @@ def is_monthly_report_file(input_pdf: Path) -> bool:
     return "广东电力现货市场结算运行情况月报" in input_pdf.name
 
 
+def is_shandong_monthly_report_file(input_pdf: Path) -> bool:
+    return "山东电力市场信息披露月报" in input_pdf.name
+
+
+def write_shandong_excel(
+    output_path: Path,
+    shandong_result: ShandongExtractionResult,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    info_df = build_shandong_info_dataframe(shandong_result.info_rows)
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        info_df.to_excel(writer, index=False, sheet_name="山东_信息汇总")
+        for sheet_name in ["山东_表2_中长期交易情况", "山东_表3_现货交易情况", "山东_表8_市场运行费用"]:
+            table_df = shandong_result.raw_tables.get(sheet_name, pd.DataFrame(columns=["raw"]))
+            table_df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+        diag_df = pd.DataFrame({"diagnostics": shandong_result.diagnostics})
+        diag_df.to_excel(writer, index=False, sheet_name="_diagnostics")
+        overlay_shandong_manual_frameworks(writer.book, shandong_result)
+
+
+def _infer_shandong_framework_month(shandong_result: ShandongExtractionResult) -> Optional[Tuple[int, int]]:
+    if shandong_result.report_month and re.match(r"^\d{4}-\d{2}$", shandong_result.report_month):
+        year_str, month_str = shandong_result.report_month.split("-")
+        return int(year_str), int(month_str)
+    return None
+
+
+def overlay_shandong_manual_frameworks(workbook: object, shandong_result: ShandongExtractionResult) -> None:
+    # 表2 framework overlay (only intended cells).
+    sheet2_name = "山东_表2_中长期交易情况"
+    if sheet2_name in workbook.sheetnames:
+        s2 = workbook[sheet2_name]
+        s2["A1"] = "单位：亿千瓦时、元/兆瓦时"
+        s2["A2"] = "（一）中长期累计交易情况"
+        s2["A3"] = "交易品种"
+        s2["A4"] = "年度双边协商交易"
+        s2["A5"] = "年度集中竞价交易"
+        s2["A6"] = "月度集中竞价交易"
+        s2["A7"] = "月内集中竞价交易"
+        s2["A8"] = "月度双边协商交易"
+        s2["A9"] = "挂牌交易"
+        s2["A10"] = "滚动撮合交易"
+        s2["B3"] = "月度累计交易电量"
+        s2["C3"] = "加权平均电价"
+        shandong_result.diagnostics.append("[INFO] 已覆盖写入山东表2手工填报框架")
+    else:
+        shandong_result.diagnostics.append("[WARN] 未找到山东_表2_中长期交易情况，无法写入框架")
+
+    # 表3 framework overlay (headers + date scaffold).
+    sheet3_name = "山东_表3_现货交易情况"
+    if sheet3_name in workbook.sheetnames:
+        s3 = workbook[sheet3_name]
+        s3["A1"] = "单位：亿千瓦时、元/兆瓦时"
+        s3["A2"] = "日期"
+        s3["B2"] = "发电侧日前出清电量"
+        s3["C2"] = "用电侧日前出清电量"
+        s3["D2"] = "日前出清均价"
+        s3["E2"] = "发电侧实时出清电量"
+        s3["F2"] = "实时出清均价"
+        ym = _infer_shandong_framework_month(shandong_result)
+        if ym is not None:
+            year, month = ym
+            day_count = calendar.monthrange(year, month)[1]
+            for day in range(1, day_count + 1):
+                s3.cell(row=day + 2, column=1).value = date(year, month, day)
+                s3.cell(row=day + 2, column=1).number_format = "yyyy-mm-dd"
+            shandong_result.diagnostics.append(f"[INFO] 已写入山东表3日期框架: {year:04d}-{month:02d}, 天数={day_count}")
+        else:
+            shandong_result.diagnostics.append("[WARN] 无法可靠解析报告年月，未写入山东表3日期框架")
+        shandong_result.diagnostics.append("[INFO] 已覆盖写入山东表3手工填报框架")
+    else:
+        shandong_result.diagnostics.append("[WARN] 未找到山东_表3_现货交易情况，无法写入框架")
+
+
 def main() -> int:
     args = parse_args()
 
@@ -2191,6 +2272,7 @@ def main() -> int:
                         )
                 return 0
             monthly_report = is_monthly_report_file(input_pdf)
+            shandong_report = is_shandong_monthly_report_file(input_pdf)
             extracted: List[ExtractedTable] = []
             if monthly_report:
                 attach1_border_tables = extract_attach1_with_border_grid(input_pdf, args.verbose)
@@ -2216,21 +2298,36 @@ def main() -> int:
                     str(input_pdf),
                     default_section_configs(),
                 )
+            elif shandong_report:
+                section_results = []
             else:
                 section_results = extract_configured_sections_from_pdf(
                     str(input_pdf),
                     default_section_configs(),
                 )
             output_path = build_output_path(args, input_pdf, batch_mode)
-            write_excel(
-                output_path,
-                extracted,
-                excel_style_mode=args.excel_style_mode,
-                section_results=section_results,
-                include_summary_sheet=not monthly_report,
-                table_sheet_base_name="附表1" if monthly_report else "Table",
-                table_write_header=not monthly_report,
-            )
+            if shandong_report:
+                shandong_result = extract_shandong_market_disclosure_monthly_report(
+                    pdf_path=str(input_pdf),
+                    text=None,
+                    tables=extracted,
+                    output_path=str(output_path),
+                    diagnostics=[],
+                )
+                write_shandong_excel(output_path, shandong_result)
+                if args.verbose:
+                    for diag in shandong_result.diagnostics:
+                        log(f"[Shandong] {diag}", args.verbose)
+            else:
+                write_excel(
+                    output_path,
+                    extracted,
+                    excel_style_mode=args.excel_style_mode,
+                    section_results=section_results,
+                    include_summary_sheet=not monthly_report,
+                    table_sheet_base_name="附表1" if monthly_report else "Table",
+                    table_write_header=not monthly_report,
+                )
             print(f"[OK] {input_pdf.name}: saved {len(extracted)} table(s) to {output_path}")
         except Exception as exc:
             print(f"[FAILED] {input_pdf}: {exc}", file=sys.stderr)
