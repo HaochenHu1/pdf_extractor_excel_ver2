@@ -2189,9 +2189,17 @@ def _infer_shandong_framework_month(shandong_result: ShandongExtractionResult) -
 
 
 def overlay_shandong_manual_frameworks(workbook: object, shandong_result: ShandongExtractionResult) -> None:
+    def _find_sheet_name(preferred_name: str, required_markers: List[str]) -> Optional[str]:
+        if preferred_name in workbook.sheetnames:
+            return preferred_name
+        for name in workbook.sheetnames:
+            if all(marker in name for marker in required_markers):
+                return name
+        return None
+
     # 表2 framework overlay (only intended cells).
-    sheet2_name = "山东_表2_中长期交易情况"
-    if sheet2_name in workbook.sheetnames:
+    sheet2_name = _find_sheet_name("山东_表2_中长期交易情况", ["表2"])
+    if sheet2_name is not None:
         s2 = workbook[sheet2_name]
         s2["A1"] = "单位：亿千瓦时、元/兆瓦时"
         s2["A2"] = "（一）中长期累计交易情况"
@@ -2210,8 +2218,8 @@ def overlay_shandong_manual_frameworks(workbook: object, shandong_result: Shando
         shandong_result.diagnostics.append("[WARN] 未找到山东_表2_中长期交易情况，无法写入框架")
 
     # 表3 framework overlay (headers + date scaffold).
-    sheet3_name = "山东_表3_现货交易情况"
-    if sheet3_name in workbook.sheetnames:
+    sheet3_name = _find_sheet_name("山东_表3_现货交易情况", ["表3"])
+    if sheet3_name is not None:
         s3 = workbook[sheet3_name]
         s3["A1"] = "单位：亿千瓦时、元/兆瓦时"
         s3["A2"] = "日期"
@@ -2233,6 +2241,39 @@ def overlay_shandong_manual_frameworks(workbook: object, shandong_result: Shando
         shandong_result.diagnostics.append("[INFO] 已覆盖写入山东表3手工填报框架")
     else:
         shandong_result.diagnostics.append("[WARN] 未找到山东_表3_现货交易情况，无法写入框架")
+
+    # 表8 framework overlay (only intended cells).
+    sheet8_name = _find_sheet_name("山东_表8_市场运行费用", ["表8"])
+    if sheet8_name is not None:
+        s8 = workbook[sheet8_name]
+        s8["A1"] = "单位：万元、元/兆瓦时"
+        s8["A2"] = "序号"
+        s8["B2"] = "类别"
+        s8["C2"] = "费用总额"
+        s8["D2"] = "分摊返还均价"
+        s8["E2"] = "分摊返还主体"
+        table8_categories = [
+            "启动费用",
+            "特殊机组补偿费用",
+            "供热考核费用",
+            "新能源场站偏差收益回收",
+            "机组考核返还费用",
+            "市场超额收益回收",
+            "用户侧日前申报偏差收益回收",
+            "发电侧中长期偏差收益回收",
+            "用户侧中长期偏差收益回收",
+            "阻塞费用",
+            "预测偏差费用",
+            "优发优购曲线匹配偏差费用",
+        ]
+        for idx, category in enumerate(table8_categories, start=1):
+            row = idx + 2
+            s8.cell(row=row, column=1).value = idx
+            s8.cell(row=row, column=2).value = category
+        shandong_result.diagnostics.append("[INFO] 已覆盖写入山东表8手工填报框架")
+        print(f"[Shandong] 已写入表8手工框架: {sheet8_name}")
+    else:
+        shandong_result.diagnostics.append("[WARN] 未找到山东_表8_市场运行费用，无法写入框架")
 
 
 def main() -> int:
