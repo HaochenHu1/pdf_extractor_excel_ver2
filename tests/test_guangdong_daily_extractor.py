@@ -16,6 +16,13 @@ def test_filename_detection():
     assert is_guangdong_daily_report("广东电力现货市场2025年1月运行日报（01.09）.pdf")
 
 
+
+
+def test_filename_detection_rejects_non_daily_reports():
+    assert not is_guangdong_daily_report("广东电力现货市场结算运行情况月报（2025年1月）.pdf")
+    assert not is_guangdong_daily_report("广东电力现货市场结算运行情况季报（2025年一季度）.pdf")
+    assert not is_guangdong_daily_report("广东电力现货市场2025年1月运行日报（01.09）月报.pdf")
+
 def test_date_extract_from_title():
     assert extract_table_operation_date_from_title("表1\n运行日2025-1-9日前交易情况") == "2025-01-09"
     assert extract_table_operation_date_from_title("表2 运行日2025年1月10日现货交易情况") == "2025-01-10"
