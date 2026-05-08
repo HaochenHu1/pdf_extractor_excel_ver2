@@ -1507,6 +1507,19 @@ def detect_pdf_kind(input_pdf: Path, sample_pages: int = 3) -> str:
         return "text"
     return "scanned"
 
+
+def get_pdf_full_text_or_pages(pdf_path: str) -> Tuple[str, List[str]]:
+    """Read full PDF text and per-page text using local PyMuPDF."""
+    doc = fitz.open(str(pdf_path))
+    try:
+        page_texts: List[str] = []
+        for page in doc:
+            page_texts.append(page.get_text("text") or "")
+        full_text = "\n".join(page_texts)
+        return full_text, page_texts
+    finally:
+        doc.close()
+
 #`extract_with_camelot(...)` is the first function that actually performs table extraction
 #Its purpose is to handle text based PDFs
 #It first tries to import camelot. If camelot is not installed, it simply returns
@@ -2420,7 +2433,7 @@ def main() -> int:
                     for diag in shandong_result.diagnostics:
                         log(f"[Shandong] {diag}", args.verbose)
             elif guangdong_daily_report:
-                raw_text = extract_pdf_text(str(input_pdf), pages="all")
+                raw_text, _page_texts = get_pdf_full_text_or_pages(str(input_pdf))
                 gd_result = extract_guangdong_daily_report(str(input_pdf), input_pdf.name, raw_text, extracted)
                 write_guangdong_daily_excel(output_path, gd_result)
                 if args.verbose:
