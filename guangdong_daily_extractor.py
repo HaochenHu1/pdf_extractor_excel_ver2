@@ -24,8 +24,15 @@ def normalize_chinese_whitespace(text: str) -> str:
 
 
 def is_guangdong_daily_report(filename: str) -> bool:
-    normalized = filename.replace("（", "(").replace("）", ")")
-    return bool(re.search(r"广东电力现货市场.*\d{4}年\d{1,2}月.*运行日报.*\(\d{1,2}\.\d{1,2}\)", normalized))
+    normalized = normalize_chinese_whitespace(filename).replace("（", "(").replace("）", ")")
+    pattern = (
+        r"^广东电力现货市场.*"
+        r"\d{4}年\d{1,2}月"
+        r".*运行日报"
+        r".*\(\d{1,2}\.\d{1,2}\)"
+        r"\.pdf$"
+    )
+    return bool(re.match(pattern, normalized, flags=re.IGNORECASE))
 
 
 def _normalize_date(y: str, m: str, d: str) -> str:
