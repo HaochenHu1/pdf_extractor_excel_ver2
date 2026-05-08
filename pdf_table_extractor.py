@@ -28,6 +28,8 @@ from shandong_monthly_extractor import (
 )
 from guangdong_daily_extractor import (
     GuangdongDailyExtractionResult,
+    _diag,
+    build_market_trading_rows,
     extract_daily_report_operation_date,
     extract_market_trading_section_text,
     extract_table1_day_ahead_price,
@@ -1507,6 +1509,19 @@ def detect_pdf_kind(input_pdf: Path, sample_pages: int = 3) -> str:
         return "text"
     return "scanned"
 
+
+def get_pdf_full_text_or_pages(pdf_path: str) -> Tuple[str, List[str]]:
+    """Read full PDF text and per-page text using local PyMuPDF."""
+    doc = fitz.open(str(pdf_path))
+    try:
+        page_texts: List[str] = []
+        for page in doc:
+            page_texts.append(page.get_text("text") or "")
+        full_text = "\n".join(page_texts)
+        return full_text, page_texts
+    finally:
+        doc.close()
+
 #`extract_with_camelot(...)` is the first function that actually performs table extraction
 #Its purpose is to handle text based PDFs
 #It first tries to import camelot. If camelot is not installed, it simply returns
@@ -2183,22 +2198,62 @@ def is_guangdong_daily_report_file(input_pdf: Path) -> bool:
 
 def write_guangdong_daily_excel(output_path: Path, result: GuangdongDailyExtractionResult) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    market_cols = [
+        "date", "source_file", "report_type", "section_title", "subsection_title", "item_no",
+        "statement_type", "metric_name", "value", "unit", "time", "fuel_type", "side", "raw_text",
+    ]
+    t1_cols = ["table_operation_date", "section", "side_or_fuel", "metric", "value", "time", "unit", "raw_text", "source_file", "table_name"]
+    t2_cols = ["table_operation_date", "section", "side_or_fuel", "metric", "value", "time", "unit", "raw_text", "source_file", "table_name"]
+
+    def _table1_unified_rows() -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = [{"table_operation_date": "", "section": "单位", "side_or_fuel": "", "metric": "", "value": "", "time": "", "unit": "单位：亿千瓦时、厘/千瓦时", "raw_text": "", "source_file": "", "table_name": ""}]
+        for r in result.table1_volume_rows:
+            out.append({
+                "table_operation_date": r.get("table_operation_date", ""), "section": "（三）日前成交电量",
+                "side_or_fuel": r.get("side", ""), "metric": r.get("category", ""), "value": r.get("value", ""),
+                "time": "", "unit": r.get("unit", ""), "raw_text": r.get("raw_text", ""), "source_file": r.get("source_file", ""), "table_name": r.get("table_name", ""),
+            })
+        for r in result.table1_price_rows:
+            out.append({
+                "table_operation_date": r.get("table_operation_date", ""), "section": "（四）日前成交电价",
+                "side_or_fuel": r.get("side_or_fuel", ""), "metric": r.get("metric", ""), "value": r.get("price", ""),
+                "time": r.get("time", ""), "unit": r.get("unit", ""), "raw_text": r.get("raw_text", ""), "source_file": r.get("source_file", ""), "table_name": r.get("table_name", ""),
+            })
+        return out
+
+    def _table2_unified_rows() -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = [{"table_operation_date": "", "section": "单位", "side_or_fuel": "", "metric": "", "value": "", "time": "", "unit": "单位：厘/千瓦时", "raw_text": "", "source_file": "", "table_name": ""}]
+        for r in result.table2_day_ahead_price_rows:
+            out.append({
+                "table_operation_date": r.get("table_operation_date", ""), "section": "（二）日前成交电价",
+                "side_or_fuel": r.get("side_or_fuel", ""), "metric": r.get("metric", ""), "value": r.get("price", ""),
+                "time": r.get("time", ""), "unit": r.get("unit", ""), "raw_text": r.get("raw_text", ""), "source_file": r.get("source_file", ""), "table_name": r.get("table_name", ""),
+            })
+        for r in result.table2_realtime_price_rows:
+            out.append({
+                "table_operation_date": r.get("table_operation_date", ""), "section": "（三）实时成交电价",
+                "side_or_fuel": r.get("side_or_fuel", ""), "metric": r.get("metric", ""), "value": r.get("price", ""),
+                "time": r.get("time", ""), "unit": r.get("unit", ""), "raw_text": r.get("raw_text", ""), "source_file": r.get("source_file", ""), "table_name": r.get("table_name", ""),
+            })
+        return out
+
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        pd.DataFrame(result.market_rows).to_excel(writer, index=False, sheet_name="市场交易情况")
-        pd.DataFrame(result.table1_volume_rows).to_excel(writer, index=False, sheet_name="表1_日前成交电量")
-        pd.DataFrame(result.table1_price_rows).to_excel(writer, index=False, sheet_name="表1_日前成交电价")
-        pd.DataFrame(result.table2_day_ahead_price_rows).to_excel(writer, index=False, sheet_name="表2_日前成交电价")
-        pd.DataFrame(result.table2_realtime_price_rows).to_excel(writer, index=False, sheet_name="表2_实时成交电价")
-        pd.DataFrame({"diagnostics": result.diagnostics}).to_excel(writer, index=False, sheet_name="_diagnostics")
+        pd.DataFrame(result.market_rows).reindex(columns=market_cols).to_excel(writer, index=False, sheet_name="市场交易情况")
+        pd.DataFrame(_table1_unified_rows()).reindex(columns=t1_cols).to_excel(writer, index=False, sheet_name="表1_运行日日前交易情况")
+        pd.DataFrame(_table2_unified_rows()).reindex(columns=t2_cols).to_excel(writer, index=False, sheet_name="表2_运行日现货交易情况")
+        pd.DataFrame(result.diagnostics).to_excel(writer, index=False, sheet_name="_diagnostics")
 
 
 def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, tables: Sequence[ExtractedTable]) -> GuangdongDailyExtractionResult:
-    diagnostics: List[str] = [f"[INFO] 检测广东日报: {source_file}"]
+    diagnostics: List[Dict[str, Any]] = [_diag(source_file, "detect", "INFO", f"检测广东日报: {source_file}", 0)]
     if not tables:
-        diagnostics.append("[WARN] 未提取到表格，仅输出文本类结果")
+        diagnostics.append(_diag(source_file, "tables", "WARN", "未提取到表格，仅输出文本类结果", 0))
     operation_date = extract_daily_report_operation_date(source_file, text)
     market_text = extract_market_trading_section_text(text)
-    market_rows = [{"source_file": source_file, "report_type": "guangdong_daily", "operation_date": operation_date or "", "section_title": "二、市场交易情况", "content": market_text}]
+    market_rows = build_market_trading_rows(market_text, source_file)
+    for row in market_rows:
+        row["date"] = operation_date or ""
+    diagnostics.append(_diag(source_file, "market_section", "INFO" if market_text else "WARN", "已提取二、市场交易情况" if market_text else "未找到二、市场交易情况", len(market_rows)))
 
     t1 = find_table_by_title(tables, r"表\s*1.*运行日.*日前交易情况")
     t2 = find_table_by_title(tables, r"表\s*2.*运行日.*现货交易情况")
@@ -2210,16 +2265,24 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
 
     if t1 is not None:
         table_date = extract_table_operation_date_from_title(t1.title or "")
+        if not table_date:
+            diagnostics.append(_diag(source_file, "table1_date", "WARN", f"表1标题日期解析失败: {t1.title or '表1'}", 0))
         t1_volume_rows = extract_table1_day_ahead_volume(source_file, t1.title or "表1", table_date, "", t1.df)
         t1_price_rows = extract_table1_day_ahead_price(source_file, t1.title or "表1", table_date, "", t1.df)
+        diagnostics.append(_diag(source_file, "table1_volume", "INFO", "表1_日前成交电量提取完成", len(t1_volume_rows)))
+        diagnostics.append(_diag(source_file, "table1_price", "INFO", "表1_日前成交电价提取完成", len(t1_price_rows)))
     else:
-        diagnostics.append("[WARN] 未找到表1")
+        diagnostics.append(_diag(source_file, "table1", "WARN", "未找到表1", 0))
     if t2 is not None:
         table_date = extract_table_operation_date_from_title(t2.title or "")
+        if not table_date:
+            diagnostics.append(_diag(source_file, "table2_date", "WARN", f"表2标题日期解析失败: {t2.title or '表2'}", 0))
         t2_da_rows = extract_table2_day_ahead_price(source_file, t2.title or "表2", table_date, "", t2.df)
         t2_rt_rows = extract_table2_realtime_price(source_file, t2.title or "表2", table_date, "", t2.df)
+        diagnostics.append(_diag(source_file, "table2_da_price", "INFO", "表2_日前成交电价提取完成", len(t2_da_rows)))
+        diagnostics.append(_diag(source_file, "table2_rt_price", "INFO", "表2_实时成交电价提取完成", len(t2_rt_rows)))
     else:
-        diagnostics.append("[WARN] 未找到表2")
+        diagnostics.append(_diag(source_file, "table2", "WARN", "未找到表2", 0))
 
     return GuangdongDailyExtractionResult("guangdong_daily", operation_date, market_rows, t1_volume_rows, t1_price_rows, t2_da_rows, t2_rt_rows, diagnostics)
 
@@ -2420,12 +2483,12 @@ def main() -> int:
                     for diag in shandong_result.diagnostics:
                         log(f"[Shandong] {diag}", args.verbose)
             elif guangdong_daily_report:
-                raw_text = extract_pdf_text(str(input_pdf), pages="all")
+                raw_text, _page_texts = get_pdf_full_text_or_pages(str(input_pdf))
                 gd_result = extract_guangdong_daily_report(str(input_pdf), input_pdf.name, raw_text, extracted)
                 write_guangdong_daily_excel(output_path, gd_result)
                 if args.verbose:
                     for diag in gd_result.diagnostics:
-                        log(f"[GuangdongDaily] {diag}", args.verbose)
+                        log(f"[GuangdongDaily] {diag.get('status','')} {diag.get('stage','')}: {diag.get('message','')}", args.verbose)
             else:
                 write_excel(
                     output_path,

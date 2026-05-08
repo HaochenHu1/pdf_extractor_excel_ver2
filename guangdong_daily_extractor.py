@@ -16,7 +16,17 @@ class GuangdongDailyExtractionResult:
     table1_price_rows: List[Dict[str, Any]]
     table2_day_ahead_price_rows: List[Dict[str, Any]]
     table2_realtime_price_rows: List[Dict[str, Any]]
-    diagnostics: List[str]
+    diagnostics: List[Dict[str, Any]]
+
+
+def _diag(source_file: str, stage: str, status: str, message: str, rows_extracted: int = 0) -> Dict[str, Any]:
+    return {
+        "source_file": source_file,
+        "stage": stage,
+        "status": status,
+        "message": message,
+        "rows_extracted": rows_extracted,
+    }
 
 
 def normalize_chinese_whitespace(text: str) -> str:
@@ -64,6 +74,57 @@ def extract_market_trading_section_text(text: str) -> str:
     t = "" if text is None else str(text)
     m = re.search(r"二、市场交易情况([\s\S]*?)(?=\n\s*三、|\Z)", t)
     return normalize_chinese_whitespace(m.group(1) if m else "")
+
+
+def build_market_trading_rows(section_text: str, source_file: str) -> List[Dict[str, Any]]:
+    section_title = "二、市场交易情况"
+    rows: List[Dict[str, Any]] = []
+    normalized = normalize_chinese_whitespace(section_text)
+    if not normalized:
+        return rows
+    for chunk in re.split(r"(?=（[一二三四五六七八九十]+）)", normalized):
+        chunk = chunk.strip(" 。")
+        if not chunk:
+            continue
+        m_sub = re.match(r"(（[一二三四五六七八九十]+）[^0-9。]*)", chunk)
+        subsection = m_sub.group(1).strip() if m_sub else ""
+        item_matches = list(re.finditer(r"(?:^|。)\s*(\d+)\.(.*?)(?=(?:。\s*\d+\.)|$)", chunk))
+        if not item_matches:
+            item_matches = [re.match(r"(?:)(.*)", chunk)]  # type: ignore[list-item]
+        for mt in item_matches:
+            if mt is None:
+                continue
+            item_no = mt.group(1) if mt.lastindex and mt.lastindex >= 1 and mt.group(1) else ""
+            body = mt.group(2) if mt.lastindex and mt.lastindex >= 2 and mt.group(2) else mt.group(0)
+            body = body.strip(" 。")
+            # generic fallback row
+            base = {
+                "source_file": source_file, "report_type": "guangdong_daily", "section_title": section_title,
+                "subsection_title": subsection, "item_no": item_no, "statement_type": "", "metric_name": "",
+                "value": "", "unit": "", "time": "", "fuel_type": "", "side": "", "raw_text": body,
+            }
+            rows.append(base.copy())
+            for side, metric in [("用电侧", "日前总成交电量"), ("发电侧", "日前总成交电量"), ("发电侧", "日前加权平均电价")]:
+                mm = re.search(rf"{side}{metric}([0-9]+(?:\.[0-9]+)?)\s*([^\d，。；]*)", body)
+                if mm:
+                    rec = base.copy()
+                    rec.update({"statement_type": "metric", "metric_name": metric, "value": mm.group(1), "unit": mm.group(2), "side": side})
+                    rows.append(rec)
+            for fuel in ["燃煤", "燃气", "核电", "新能源"]:
+                mm = re.search(rf"{fuel}([0-9]+(?:\.[0-9]+)?)\s*([^\d，。；]*)", body)
+                if mm:
+                    rec = base.copy()
+                    rec.update({"statement_type": "metric", "metric_name": "日前成交电量", "value": mm.group(1), "unit": mm.group(2), "fuel_type": fuel})
+                    rows.append(rec)
+            hi = re.search(r"最高([0-9]+(?:\.[0-9]+)?)\s*([^\d，。；]*)", body)
+            lo = re.search(r"最低([0-9]+(?:\.[0-9]+)?)\s*([^\d，。；]*)", body)
+            if hi:
+                rec = base.copy(); rec.update({"statement_type": "metric", "metric_name": "日前机组成交价最高", "value": hi.group(1), "unit": hi.group(2)})
+                rows.append(rec)
+            if lo:
+                rec = base.copy(); rec.update({"statement_type": "metric", "metric_name": "日前机组成交价最低", "value": lo.group(1), "unit": lo.group(2)})
+                rows.append(rec)
+    return rows
 
 
 def find_table_by_title(tables: Sequence[Any], table_title_pattern: str) -> Optional[Any]:
