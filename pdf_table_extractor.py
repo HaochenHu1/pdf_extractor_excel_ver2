@@ -2194,6 +2194,8 @@ def write_guangdong_daily_excel(output_path: Path, result: GuangdongDailyExtract
 
 def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, tables: Sequence[ExtractedTable]) -> GuangdongDailyExtractionResult:
     diagnostics: List[str] = [f"[INFO] 检测广东日报: {source_file}"]
+    if not tables:
+        diagnostics.append("[WARN] 未提取到表格，仅输出文本类结果")
     operation_date = extract_daily_report_operation_date(source_file, text)
     market_text = extract_market_trading_section_text(text)
     market_rows = [{"source_file": source_file, "report_type": "guangdong_daily", "operation_date": operation_date or "", "section_title": "二、市场交易情况", "content": market_text}]
@@ -2380,7 +2382,7 @@ def main() -> int:
 
             if not extracted:
                 extracted = extract_tables_for_pdf(input_pdf, args)
-            if not extracted:
+            if not extracted and not guangdong_daily_report:
                 print(
                     (
                         f"No tables extracted from {input_pdf.name}. If scanned, install img2table and OCR support, "
