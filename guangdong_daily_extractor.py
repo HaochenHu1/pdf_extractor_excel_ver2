@@ -128,12 +128,21 @@ def build_market_trading_rows(section_text: str, source_file: str) -> List[Dict[
     return rows
 
 
+def _normalize_table_title_for_match(title: str) -> str:
+    t = normalize_chinese_whitespace(title or "").replace("\n", "")
+    # unify date separators/variants often seen in OCR/PDF extraction
+    t = t.replace("－", "-").replace("—", "-").replace("–", "-").replace("—", "-")
+    t = t.replace("年", "-").replace("月", "-").replace("日", "")
+    return t
+
+
 def find_table_by_title(tables: Sequence[Any], table_title_pattern: str) -> Optional[Any]:
     p = re.compile(table_title_pattern)
     for table in tables:
-        title = normalize_chinese_whitespace(getattr(table, "title", "") or "")
-        title = title.replace("\n", "")
-        if p.search(title):
+        title_raw = getattr(table, "title", "") or ""
+        title = _normalize_table_title_for_match(title_raw)
+        compact = re.sub(r"\s+", "", title)
+        if p.search(title) or p.search(compact):
             return table
     return None
 

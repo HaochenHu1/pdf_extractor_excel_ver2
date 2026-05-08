@@ -2271,8 +2271,8 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
         row["date"] = operation_date or ""
     diagnostics.append(_diag(source_file, "market_section", "INFO" if market_text else "WARN", "已提取二、市场交易情况" if market_text else "未找到二、市场交易情况", len(market_rows)))
 
-    t1 = find_table_by_title(tables, r"表\s*1.*运行日.*日前交易情况")
-    t2 = find_table_by_title(tables, r"表\s*2.*运行日.*现货交易情况")
+    t1 = find_table_by_title(tables, r"表\s*1.*(?:运行日)?(?:\d{4}[-年]\d{1,2}[-月]\d{1,2}日?)?.*日前交易情况")
+    t2 = find_table_by_title(tables, r"表\s*2.*(?:运行日)?(?:\d{4}[-年]\d{1,2}[-月]\d{1,2}日?)?.*现货交易情况")
 
     t1_volume_rows: List[Dict[str, Any]] = []
     t1_price_rows: List[Dict[str, Any]] = []
