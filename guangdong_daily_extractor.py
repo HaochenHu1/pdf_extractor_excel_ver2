@@ -104,20 +104,21 @@ def build_market_trading_rows(section_text: str, source_file: str) -> List[Dict[
                 "value": "", "unit": "", "time": "", "fuel_type": "", "side": "", "raw_text": body,
             }
             rows.append(base.copy())
+            unit_pat = r"([^\d，。；（）()]*?(?:亿\s*kWh|亿kWh|厘/千瓦时|MW|个|%))"
             for side, metric in [("用电侧", "日前总成交电量"), ("发电侧", "日前总成交电量"), ("发电侧", "日前加权平均电价")]:
-                mm = re.search(rf"{side}{metric}([0-9]+(?:\.[0-9]+)?)\s*([^\d，。；]*)", body)
+                mm = re.search(rf"{side}{metric}([0-9]+(?:\.[0-9]+)?)\s*{unit_pat}", body)
                 if mm:
                     rec = base.copy()
                     rec.update({"statement_type": "metric", "metric_name": metric, "value": mm.group(1), "unit": mm.group(2), "side": side})
                     rows.append(rec)
             for fuel in ["燃煤", "燃气", "核电", "新能源"]:
-                mm = re.search(rf"{fuel}([0-9]+(?:\.[0-9]+)?)\s*([^\d，。；]*)", body)
+                mm = re.search(rf"{fuel}([0-9]+(?:\.[0-9]+)?)\s*{unit_pat}", body)
                 if mm:
                     rec = base.copy()
                     rec.update({"statement_type": "metric", "metric_name": "日前成交电量", "value": mm.group(1), "unit": mm.group(2), "fuel_type": fuel})
                     rows.append(rec)
-            hi = re.search(r"最高([0-9]+(?:\.[0-9]+)?)\s*([^\d，。；]*)", body)
-            lo = re.search(r"最低([0-9]+(?:\.[0-9]+)?)\s*([^\d，。；]*)", body)
+            hi = re.search(rf"最高([0-9]+(?:\.[0-9]+)?)\s*{unit_pat}", body)
+            lo = re.search(rf"最低([0-9]+(?:\.[0-9]+)?)\s*{unit_pat}", body)
             if hi:
                 rec = base.copy(); rec.update({"statement_type": "metric", "metric_name": "日前机组成交价最高", "value": hi.group(1), "unit": hi.group(2)})
                 rows.append(rec)
@@ -149,6 +150,18 @@ def split_price_and_time(cell_text: str) -> Tuple[str, str, str]:
 
 def _rows_to_text_rows(df: pd.DataFrame) -> List[List[str]]:
     return [[normalize_chinese_whitespace(x) for x in row] for row in df.fillna("").values.tolist()]
+
+
+def normalize_unit_text(unit: str) -> str:
+    t = normalize_chinese_whitespace(unit).replace(" ", "")
+    t = re.sub(r"[。；，]+$", "", t)
+    t = re.split(r"[（()）]", t)[0]
+    t = t.strip()
+    t = t.replace("亿千瓦时", "亿kWh").replace("亿kwh", "亿kWh").replace("亿KWH", "亿kWh").replace("亿 kWh", "亿kWh")
+    for k in ["亿kWh", "厘/千瓦时", "MW", "个", "%"]:
+        if k in t:
+            return k
+    return t
 
 
 def _extract_price_rows(source_file: str, table_name: str, section: str, table_date: Optional[str], unit: str, rows: List[List[str]]) -> List[Dict[str, Any]]:
