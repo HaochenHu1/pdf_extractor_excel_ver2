@@ -39,6 +39,7 @@ from guangdong_daily_extractor import (
     extract_table_operation_date_from_title,
     find_table_by_title,
     is_guangdong_daily_report,
+    normalize_unit_text,
 )
 
 @dataclass
@@ -2211,7 +2212,7 @@ def write_guangdong_daily_excel(output_path: Path, result: GuangdongDailyExtract
                 "date": str(r.get("date", "") or "").replace("-", "/"),
                 "type": type_name,
                 "value": r.get("value", ""),
-                "unit": r.get("unit", ""),
+                "unit": normalize_unit_text(str(r.get("unit", "") or "")),
             })
         pd.DataFrame(market_out, columns=["date", "type", "value", "unit"]).to_excel(
             writer, index=False, sheet_name="市场交易情况"
@@ -2229,11 +2230,6 @@ def write_guangdong_daily_excel(output_path: Path, result: GuangdongDailyExtract
 
         # 表1
         t1_unit = "单位：电力(MW)、电量(亿千瓦时)、电价(厘/千瓦时)、个"
-        if result.table1_volume_rows:
-            raw = str(result.table1_volume_rows[0].get("raw_text", "") or "")
-            m = re.search(r"单位[:：].*", raw)
-            if m:
-                t1_unit = m.group(0)
         ws1["A1"] = t1_unit
         ws1["A2"] = "（三）日前成交电量"
         ws1.append(["发电侧（含基数及代购电量）", "燃煤", "燃气", "核电", "新能源", "合计"])
@@ -2249,11 +2245,6 @@ def write_guangdong_daily_excel(output_path: Path, result: GuangdongDailyExtract
 
         # 表2
         t2_unit = "单位：厘/千瓦时"
-        if result.table2_day_ahead_price_rows:
-            raw = str(result.table2_day_ahead_price_rows[0].get("raw_text", "") or "")
-            m = re.search(r"单位[:：].*", raw)
-            if m:
-                t2_unit = m.group(0)
         ws2["A1"] = t2_unit
         ws2["A2"] = "（二）日前成交电价"
         ws2.append(["", "最高电价", "最低电价", "平均电价", "电价环比"])
@@ -2288,24 +2279,72 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
     t2_da_rows: List[Dict[str, Any]] = []
     t2_rt_rows: List[Dict[str, Any]] = []
 
+    def _rows_dump(table: ExtractedTable) -> List[List[str]]:
+        return [[normalize_cell(v) for v in row] for row in table.df.fillna("").values.tolist()]
+
+    def _extract_rows_between(rows: List[List[str]], start_pat: str, end_pat: Optional[str] = None) -> List[List[str]]:
+        s = -1
+        e = len(rows)
+        for i, row in enumerate(rows):
+            flat = "".join(row)
+            if re.search(start_pat, flat):
+                s = i
+                break
+        if s < 0:
+            return []
+        if end_pat:
+            for j in range(s + 1, len(rows)):
+                if re.search(end_pat, "".join(rows[j])):
+                    e = j
+                    break
+        return rows[s:e]
+
+    def _reconstruct_table1_volume(rows: List[List[str]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        section = _extract_rows_between(rows, r"（三）日前成交电量", r"（四）日前成交电价")
+        side = ""
+        for row in section:
+            cells = [c for c in row if c]
+            if not cells:
+                continue
+            first = cells[0]
+            if "发电侧" in first:
+                side = "发电侧（含基数及代购电量）"
+                labels = ["燃煤", "燃气", "核电", "新能源", "合计"]
+                values = [c for c in cells[1:] if re.search(r"\d", c)]
+                for i, label in enumerate(labels):
+                    out.append({"side": side, "category": label, "value": values[i] if i < len(values) else ""})
+            elif first == "用电侧":
+                side = "用电侧"
+            elif first in {"售电公司", "大用户", "合计"}:
+                v = next((c for c in cells[1:] if re.search(r"\d", c)), "")
+                out.append({"side": side, "category": first, "value": v})
+        return out
+
     if t1 is not None:
+        raw_rows = _rows_dump(t1)
+        diagnostics.append(_diag(source_file, "table1_raw_rows", "INFO", f"表1原始行: {raw_rows}", len(raw_rows)))
         table_date = extract_table_operation_date_from_title(t1.title or "")
         if not table_date:
             diagnostics.append(_diag(source_file, "table1_date", "WARN", f"表1标题日期解析失败: {t1.title or '表1'}", 0))
         t1_volume_rows = extract_table1_day_ahead_volume(source_file, t1.title or "表1", table_date, "", t1.df)
         t1_price_rows = extract_table1_day_ahead_price(source_file, t1.title or "表1", table_date, "", t1.df)
-        diagnostics.append(_diag(source_file, "table1_volume", "INFO", "表1_日前成交电量提取完成", len(t1_volume_rows)))
+        if not t1_volume_rows:
+            t1_volume_rows = _reconstruct_table1_volume(raw_rows)
+        diagnostics.append(_diag(source_file, "table1_volume", "INFO" if t1_volume_rows else "WARN", "表1_日前成交电量提取完成" if t1_volume_rows else "表1_日前成交电量映射为空", len(t1_volume_rows)))
         diagnostics.append(_diag(source_file, "table1_price", "INFO", "表1_日前成交电价提取完成", len(t1_price_rows)))
     else:
         diagnostics.append(_diag(source_file, "table1", "WARN", "未找到表1", 0))
     if t2 is not None:
+        raw_rows = _rows_dump(t2)
+        diagnostics.append(_diag(source_file, "table2_raw_rows", "INFO", f"表2原始行: {raw_rows}", len(raw_rows)))
         table_date = extract_table_operation_date_from_title(t2.title or "")
         if not table_date:
             diagnostics.append(_diag(source_file, "table2_date", "WARN", f"表2标题日期解析失败: {t2.title or '表2'}", 0))
         t2_da_rows = extract_table2_day_ahead_price(source_file, t2.title or "表2", table_date, "", t2.df)
         t2_rt_rows = extract_table2_realtime_price(source_file, t2.title or "表2", table_date, "", t2.df)
-        diagnostics.append(_diag(source_file, "table2_da_price", "INFO", "表2_日前成交电价提取完成", len(t2_da_rows)))
-        diagnostics.append(_diag(source_file, "table2_rt_price", "INFO", "表2_实时成交电价提取完成", len(t2_rt_rows)))
+        diagnostics.append(_diag(source_file, "table2_da_price", "INFO" if t2_da_rows else "WARN", "表2_日前成交电价提取完成" if t2_da_rows else "表2_日前成交电价映射为空", len(t2_da_rows)))
+        diagnostics.append(_diag(source_file, "table2_rt_price", "INFO" if t2_rt_rows else "WARN", "表2_实时成交电价提取完成" if t2_rt_rows else "表2_实时成交电价映射为空", len(t2_rt_rows)))
     else:
         diagnostics.append(_diag(source_file, "table2", "WARN", "未找到表2", 0))
 
