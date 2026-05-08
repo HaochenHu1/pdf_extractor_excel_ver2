@@ -2198,12 +2198,49 @@ def is_guangdong_daily_report_file(input_pdf: Path) -> bool:
 
 def write_guangdong_daily_excel(output_path: Path, result: GuangdongDailyExtractionResult) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    market_cols = [
+        "date", "source_file", "report_type", "section_title", "subsection_title", "item_no",
+        "statement_type", "metric_name", "value", "unit", "time", "fuel_type", "side", "raw_text",
+    ]
+    t1_cols = ["table_operation_date", "section", "side_or_fuel", "metric", "value", "time", "unit", "raw_text", "source_file", "table_name"]
+    t2_cols = ["table_operation_date", "section", "side_or_fuel", "metric", "value", "time", "unit", "raw_text", "source_file", "table_name"]
+
+    def _table1_unified_rows() -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = [{"table_operation_date": "", "section": "单位", "side_or_fuel": "", "metric": "", "value": "", "time": "", "unit": "单位：亿千瓦时、厘/千瓦时", "raw_text": "", "source_file": "", "table_name": ""}]
+        for r in result.table1_volume_rows:
+            out.append({
+                "table_operation_date": r.get("table_operation_date", ""), "section": "（三）日前成交电量",
+                "side_or_fuel": r.get("side", ""), "metric": r.get("category", ""), "value": r.get("value", ""),
+                "time": "", "unit": r.get("unit", ""), "raw_text": r.get("raw_text", ""), "source_file": r.get("source_file", ""), "table_name": r.get("table_name", ""),
+            })
+        for r in result.table1_price_rows:
+            out.append({
+                "table_operation_date": r.get("table_operation_date", ""), "section": "（四）日前成交电价",
+                "side_or_fuel": r.get("side_or_fuel", ""), "metric": r.get("metric", ""), "value": r.get("price", ""),
+                "time": r.get("time", ""), "unit": r.get("unit", ""), "raw_text": r.get("raw_text", ""), "source_file": r.get("source_file", ""), "table_name": r.get("table_name", ""),
+            })
+        return out
+
+    def _table2_unified_rows() -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = [{"table_operation_date": "", "section": "单位", "side_or_fuel": "", "metric": "", "value": "", "time": "", "unit": "单位：厘/千瓦时", "raw_text": "", "source_file": "", "table_name": ""}]
+        for r in result.table2_day_ahead_price_rows:
+            out.append({
+                "table_operation_date": r.get("table_operation_date", ""), "section": "（二）日前成交电价",
+                "side_or_fuel": r.get("side_or_fuel", ""), "metric": r.get("metric", ""), "value": r.get("price", ""),
+                "time": r.get("time", ""), "unit": r.get("unit", ""), "raw_text": r.get("raw_text", ""), "source_file": r.get("source_file", ""), "table_name": r.get("table_name", ""),
+            })
+        for r in result.table2_realtime_price_rows:
+            out.append({
+                "table_operation_date": r.get("table_operation_date", ""), "section": "（三）实时成交电价",
+                "side_or_fuel": r.get("side_or_fuel", ""), "metric": r.get("metric", ""), "value": r.get("price", ""),
+                "time": r.get("time", ""), "unit": r.get("unit", ""), "raw_text": r.get("raw_text", ""), "source_file": r.get("source_file", ""), "table_name": r.get("table_name", ""),
+            })
+        return out
+
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        pd.DataFrame(result.market_rows).to_excel(writer, index=False, sheet_name="市场交易情况")
-        pd.DataFrame(result.table1_volume_rows).to_excel(writer, index=False, sheet_name="表1_日前成交电量")
-        pd.DataFrame(result.table1_price_rows).to_excel(writer, index=False, sheet_name="表1_日前成交电价")
-        pd.DataFrame(result.table2_day_ahead_price_rows).to_excel(writer, index=False, sheet_name="表2_日前成交电价")
-        pd.DataFrame(result.table2_realtime_price_rows).to_excel(writer, index=False, sheet_name="表2_实时成交电价")
+        pd.DataFrame(result.market_rows).reindex(columns=market_cols).to_excel(writer, index=False, sheet_name="市场交易情况")
+        pd.DataFrame(_table1_unified_rows()).reindex(columns=t1_cols).to_excel(writer, index=False, sheet_name="表1_运行日日前交易情况")
+        pd.DataFrame(_table2_unified_rows()).reindex(columns=t2_cols).to_excel(writer, index=False, sheet_name="表2_运行日现货交易情况")
         pd.DataFrame(result.diagnostics).to_excel(writer, index=False, sheet_name="_diagnostics")
 
 
@@ -2214,6 +2251,8 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
     operation_date = extract_daily_report_operation_date(source_file, text)
     market_text = extract_market_trading_section_text(text)
     market_rows = build_market_trading_rows(market_text, source_file)
+    for row in market_rows:
+        row["date"] = operation_date or ""
     diagnostics.append(_diag(source_file, "market_section", "INFO" if market_text else "WARN", "已提取二、市场交易情况" if market_text else "未找到二、市场交易情况", len(market_rows)))
 
     t1 = find_table_by_title(tables, r"表\s*1.*运行日.*日前交易情况")
