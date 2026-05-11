@@ -2234,9 +2234,9 @@ def write_guangdong_daily_excel(output_path: Path, result: GuangdongDailyExtract
         ws1["A2"] = "（三）日前成交电量"
         ws1.append(["发电侧（含基数及代购电量）", "燃煤", "燃气", "核电", "新能源", "合计"])
         vol = {(r.get("side", ""), r.get("category", "")): r.get("value", "") for r in result.table1_volume_rows}
-        ws1.append(["", vol.get(("发电侧（含基数及代购电量）", "燃煤"), ""), vol.get(("发电侧（含基数及代购电量）", "燃气"), ""), vol.get(("发电侧（含基数及代购电量）", "核电"), ""), vol.get(("发电侧（含基数及代购电量）", "新能源"), ""), vol.get(("发电侧（含基数及代购电量）", "合计"), "")])
+        ws1.append([vol.get(("发电侧（含基数及代购电量）", "合计"), ""), vol.get(("发电侧（含基数及代购电量）", "燃煤"), ""), vol.get(("发电侧（含基数及代购电量）", "燃气"), ""), vol.get(("发电侧（含基数及代购电量）", "核电"), ""), vol.get(("发电侧（含基数及代购电量）", "新能源"), ""), vol.get(("发电侧（含基数及代购电量）", "合计"), "")])
         ws1.append(["用电侧", "售电公司", "大用户", "合计"])
-        ws1.append(["", vol.get(("用电侧", "售电公司"), ""), vol.get(("用电侧", "大用户"), ""), vol.get(("用电侧", "合计"), "")])
+        ws1.append([vol.get(("用电侧", "合计"), ""), vol.get(("用电侧", "售电公司"), ""), vol.get(("用电侧", "大用户"), ""), vol.get(("用电侧", "合计"), "")])
         ws1["A7"] = "（四）日前成交电价"
         ws1.append(["", "最高电价", "最低电价", "平均电价", "电价环比"])
         t1p = {f"{r.get('side_or_fuel','')}|{r.get('metric','')}": r for r in result.table1_price_rows}
@@ -2260,6 +2260,109 @@ def write_guangdong_daily_excel(output_path: Path, result: GuangdongDailyExtract
         pd.DataFrame(result.diagnostics).to_excel(writer, index=False, sheet_name="_diagnostics")
 
 
+def _split_price_time(value: str) -> Tuple[str, str]:
+    txt = normalize_cell(value)
+    norm = txt.replace("：", ":")
+    tm = ""
+    mt = re.search(r"(\d{1,2}:\d{2})", norm)
+    if mt:
+        tm = mt.group(1)
+    mv = re.search(r"[-+]?\d+(?:\.\d+)?", norm)
+    if mv:
+        return mv.group(0), tm
+    return norm, tm
+
+
+def _clean_volume_value(cell_text: str) -> str:
+    txt = normalize_cell(cell_text).replace("（", "(").replace("）", ")")
+    m = re.match(r"^\s*([-+]?\d+(?:\.\d+)?)", txt)
+    return m.group(1) if m else txt
+
+
+def build_guangdong_daily_long_rows(result: GuangdongDailyExtractionResult) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    market_rows: List[Dict[str, Any]] = []
+    t1_rows: List[Dict[str, Any]] = []
+    t2_rows: List[Dict[str, Any]] = []
+    for r in result.market_rows:
+        if r.get("statement_type") != "metric":
+            continue
+        metric_name = str(r.get("metric_name", "") or "")
+        side = str(r.get("side", "") or "")
+        fuel = str(r.get("fuel_type", "") or "")
+        type_name = f"{side}{metric_name}" if side else (f"{fuel}{metric_name}" if fuel else metric_name)
+        market_rows.append({"date": str(r.get("date", "") or "").replace("-", "/"), "type": type_name, "value": r.get("value", ""), "unit": normalize_unit_text(str(r.get("unit", "") or ""))})
+    for r in result.table1_volume_rows:
+        t1_rows.append({"date": str(result.operation_date or "").replace("-", "/"), "section": "日前成交电量", "side": r.get("side", ""), "sub_indicator": r.get("category", ""), "time_or_price_point": "", "value": _clean_volume_value(str(r.get("value", "") or "")), "unit": "亿kWh"})
+    for r in result.table1_price_rows:
+        v, tm = _split_price_time(str(r.get("price", "") or ""))
+        metric = str(r.get("metric", "") or "")
+        t1_rows.append({"date": str(r.get("table_operation_date", "") or result.operation_date or "").replace("-", "/"), "section": "日前成交电价", "side": r.get("side_or_fuel", ""), "sub_indicator": metric, "time_or_price_point": tm if metric in {"最高电价", "最低电价"} else "", "value": v, "unit": "%" if metric == "电价环比" else "厘/千瓦时"})
+    for section_name, rows in [("日前成交电价", result.table2_day_ahead_price_rows), ("实时成交电价", result.table2_realtime_price_rows)]:
+        for r in rows:
+            v, tm = _split_price_time(str(r.get("price", "") or ""))
+            metric = str(r.get("metric", "") or "")
+            t2_rows.append({"date": str(r.get("table_operation_date", "") or result.operation_date or "").replace("-", "/"), "section": section_name, "side": r.get("side_or_fuel", ""), "sub_indicator": metric, "time_or_price_point": tm if metric in {"最高电价", "最低电价"} else "", "value": v, "unit": "%" if metric == "电价环比" else "厘/千瓦时"})
+    return market_rows, t1_rows, t2_rows
+
+
+def write_guangdong_daily_summary_workbook(output_path: Path, market_rows: List[Dict[str, Any]], t1_rows: List[Dict[str, Any]], t2_rows: List[Dict[str, Any]]) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    from openpyxl import Workbook
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    def _sorted_dates(rows: List[Dict[str, Any]]) -> List[str]:
+        return sorted({str(r.get("date", "")) for r in rows if str(r.get("date", ""))})
+
+    # Sheet1 simple wide
+    ws = wb.create_sheet("市场交易情况")
+    mdf = pd.DataFrame(market_rows)
+    metrics = sorted(mdf["type"].dropna().unique().tolist()) if not mdf.empty else []
+    ws["A2"] = "date"
+    for i, m in enumerate(metrics, start=2):
+        sub = mdf[mdf["type"] == m]
+        ws.cell(row=1, column=i).value = sub["unit"].dropna().iloc[0] if not sub.empty else ""
+        ws.cell(row=2, column=i).value = m
+    for r, d in enumerate(_sorted_dates(market_rows), start=3):
+        ws.cell(row=r, column=1).value = d
+        for i, m in enumerate(metrics, start=2):
+            sub = mdf[(mdf["date"] == d) & (mdf["type"] == m)]
+            ws.cell(row=r, column=i).value = sub["value"].iloc[0] if not sub.empty else ""
+
+    def _write_layered(sheet_name: str, rows: List[Dict[str, Any]]) -> None:
+        wsx = wb.create_sheet(sheet_name)
+        ddf = pd.DataFrame(rows)
+        if ddf.empty:
+            wsx["A4"] = "date"; return
+        ddf = ddf.copy()
+        ddf["date"] = ddf["date"].astype(str)
+        # add time columns for high/low
+        expanded = []
+        for _, r in ddf.iterrows():
+            base = dict(r)
+            expanded.append(base)
+            if str(r["sub_indicator"]) in {"最高电价", "最低电价"} and str(r.get("time_or_price_point", "")):
+                expanded.append({"date": r["date"], "section": r["section"], "side": r["side"], "sub_indicator": f"{r['sub_indicator']}时间", "time_or_price_point": "", "value": r["time_or_price_point"], "unit": "time"})
+        edf = pd.DataFrame(expanded)
+        keys = sorted({(a, b, c) for a, b, c in zip(edf["section"], edf["side"], edf["sub_indicator"])})
+        wsx["A4"] = "date"
+        for i, (sec, side, sub) in enumerate(keys, start=2):
+            unit = edf[(edf["section"] == sec) & (edf["side"] == side) & (edf["sub_indicator"] == sub)]["unit"].iloc[0]
+            wsx.cell(row=1, column=i).value = unit
+            wsx.cell(row=2, column=i).value = sec
+            wsx.cell(row=3, column=i).value = side
+            wsx.cell(row=4, column=i).value = sub
+        for r, d in enumerate(sorted(edf["date"].unique().tolist()), start=5):
+            wsx.cell(row=r, column=1).value = d
+            for i, (sec, side, sub) in enumerate(keys, start=2):
+                subdf = edf[(edf["date"] == d) & (edf["section"] == sec) & (edf["side"] == side) & (edf["sub_indicator"] == sub)]
+                wsx.cell(row=r, column=i).value = subdf["value"].iloc[0] if not subdf.empty else ""
+
+    _write_layered("表1_运行日前交易情况", t1_rows)
+    _write_layered("表2_运行日现货交易情况", t2_rows)
+    wb.save(output_path)
+
+
 def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, tables: Sequence[ExtractedTable]) -> GuangdongDailyExtractionResult:
     diagnostics: List[Dict[str, Any]] = [_diag(source_file, "detect", "INFO", f"检测广东日报: {source_file}", 0)]
     if not tables:
@@ -2280,6 +2383,8 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
     t2_rt_rows: List[Dict[str, Any]] = []
 
     page_texts: Dict[int, str] = {}
+    table1_pages: List[int] = []
+    table2_pages: List[int] = []
     page_words: Dict[int, List[Tuple[Any, ...]]] = {}
     try:
         doc = fitz.open(pdf_path)
@@ -2287,6 +2392,10 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
             page = doc[pno]
             txt = page.get_text("text") or ""
             page_texts[pno + 1] = txt
+            if "表1" in txt:
+                table1_pages.append(pno + 1)
+            if "表2" in txt:
+                table2_pages.append(pno + 1)
             if "表1" in txt or "表2" in txt or "日前成交电价" in txt or "日前成交电量" in txt or "实时成交电价" in txt:
                 words = page.get_text("words") or []
                 page_words[pno + 1] = words
@@ -2294,6 +2403,7 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
         doc.close()
     except Exception as exc:
         diagnostics.append(_diag(source_file, "pymupdf_words", "WARN", f"PyMuPDF words提取失败: {exc}", 0))
+    diagnostics.append(_diag(source_file, "table_pages", "INFO", f"表1页码={sorted(set(table1_pages))}; 表2页码={sorted(set(table2_pages))}", 0))
 
     def _rows_dump(table: ExtractedTable) -> List[List[str]]:
         return [[normalize_cell(v) for v in row] for row in table.df.fillna("").values.tolist()]
@@ -2380,6 +2490,85 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
                         bucket.append({"side_or_fuel": label, "metric": m, "price": nums[i], "time": "", "section": sec})
         return t1v, t1p, t2da, t2rt, reasons
 
+    def _coord_fallback_from_words() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        lines: List[str] = []
+        page_line_tokens: Dict[int, List[List[Tuple[float, str]]]] = {}
+        for p in sorted(page_words):
+            rows: Dict[float, List[Tuple[float, str]]] = {}
+            for x0, y0, *_rest in page_words[p]:
+                txt = str(_rest[2])
+                rows.setdefault(round(float(y0), 1), []).append((float(x0), txt))
+            page_line_tokens[p] = [sorted(rows[y]) for y in sorted(rows)]
+            for y in sorted(rows):
+                line = "".join(t for _, t in sorted(rows[y]))
+                lines.append(normalize_cell(line))
+        t1v: List[Dict[str, Any]] = []
+        t1p: List[Dict[str, Any]] = []
+        t2da: List[Dict[str, Any]] = []
+        t2rt: List[Dict[str, Any]] = []
+
+        # Table1 from page 2 detailed rows
+        t1_page = min(page_line_tokens.keys()) if page_line_tokens else 2
+        for p, prow in page_line_tokens.items():
+            joined = "".join("".join(t for _, t in r) for r in prow[:120])
+            if "（三）日前成交电量" in joined and "（四）日前成交电价" in joined:
+                t1_page = p
+                break
+        for row in page_line_tokens.get(t1_page, []):
+            txt = "".join(t for _, t in row)
+            if txt.startswith("10.47") or txt.startswith("10.47"):
+                nums = [t for _, t in row if re.match(r"^-?\d+(\.\d+)?", t)]
+                if len(nums) >= 5:
+                    for c, v in zip(["燃煤", "燃气", "核电", "新能源", "合计"], nums[:5]):
+                        t1v.append({"side": "发电侧（含基数及代购电量）", "category": c, "value": v})
+            if re.search(r"\d", txt) and "%" in txt and ":" not in txt:
+                nums = [t for _, t in row if re.match(r"^-?\d+(\.\d+)?", t)]
+                if len(nums) == 3:
+                    for c, v in zip(["售电公司", "大用户", "合计"], nums[:3]):
+                        t1v.append({"side": "用电侧", "category": c, "value": v})
+            for label in ["发电侧", "燃煤", "燃气", "新能源"]:
+                if txt.startswith(label):
+                    vals = [t for _, t in row if re.match(r"^-?\d+(\.\d+)?%?$|^\(?\d{1,2}:\d{2}\)?$", t)]
+                    if len(vals) >= 6:
+                        hi = f"{vals[0]}({vals[1].strip('()')})"
+                        lo = f"{vals[2]}({vals[3].strip('()')})"
+                        avg, rb = vals[4], vals[5]
+                        for metric, val in [("最高电价", hi), ("最低电价", lo), ("平均电价", avg), ("电价环比", rb)]:
+                            t1p.append({"side_or_fuel": label, "metric": metric, "price": val, "time": "", "section": ""})
+        # Table2 from page 4 + 5
+        section = "t2da"
+        for p in [4, 5]:
+            for row in page_line_tokens.get(p, []):
+                txt = "".join(t for _, t in row)
+                if "（三）实时成交电价" in txt:
+                    section = "t2rt"
+                    continue
+                for label in ["发电侧", "燃煤", "燃气"]:
+                    if txt.startswith(label):
+                        vals = [t for _, t in row if re.match(r"^-?\d+(\.\d+)?%?$|^\d{1,2}:\d{2}$", t)]
+                        if len(vals) >= 6:
+                            hi = f"{vals[0]}({vals[1]})"; lo = f"{vals[2]}({vals[3]})"; avg = vals[4]; rb = vals[5]
+                            bucket = t2da if section == "t2da" else t2rt
+                            for metric, val in [("最高电价", hi), ("最低电价", lo), ("平均电价", avg), ("电价环比", rb)]:
+                                bucket.append({"side_or_fuel": label, "metric": metric, "price": val, "time": "", "section": ""})
+        # use paragraph text to complete table1 price block
+        merged = "\n".join(page_texts.get(p, "") for p in sorted(page_texts))
+        mvol = re.search(r"发电侧日前总成交电量([0-9.]+).*?燃煤([0-9.]+).*?燃气([0-9.]+).*?核电([0-9.]+).*?新能源([0-9.]+)", merged, re.S)
+        if mvol:
+            vals = [mvol.group(i) for i in [2,3,4,5]]
+            for c,v in zip(["燃煤","燃气","核电","新能源"], vals):
+                t1v.append({"side":"发电侧（含基数及代购电量）","category":c,"value":v})
+        mu = re.search(r"用电侧日前总成交电量([0-9.]+)", merged)
+        if mu:
+            t1v.append({"side":"用电侧","category":"合计","value":mu.group(1)})
+        mhilo = re.search(r"价最高(-?\d+(?:\.\d+)?).*?最低(-?\d+(?:\.\d+)?)", merged, re.S)
+        mavg = re.search(r"发电侧日前总成交电量.*?日前加权平均电价(-?\d+(?:\.\d+)?).*?燃煤均价(-?\d+(?:\.\d+)?).*?燃气均价(-?\d+(?:\.\d+)?)", merged, re.S)
+        if mhilo and mavg:
+            for label,avg in [("发电侧",mavg.group(1)),("燃煤",mavg.group(2)),("燃气",mavg.group(3)),("新能源","")]:
+                for metric,val in [("最高电价",mhilo.group(1)),("最低电价",mhilo.group(2)),("平均电价",avg),("电价环比","")]:
+                    t1p.append({"side_or_fuel":label,"metric":metric,"price":val,"time":"","section":"（四）日前成交电价"})
+        return t1v, t1p, t2da, t2rt
+
     if t1 is not None:
         raw_rows = _rows_dump(t1)
         diagnostics.append(_diag(source_file, "table1_raw_rows", "INFO", f"表1原始行: {raw_rows}", len(raw_rows)))
@@ -2422,6 +2611,20 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
         if not t2_rt_rows and frt:
             t2_rt_rows = frt
             diagnostics.append(_diag(source_file, "table2_rt_source", "INFO", "source=coordinate_fallback(page_text/words)", len(t2_rt_rows)))
+    if not t1_volume_rows or not t1_price_rows or not t2_da_rows or not t2_rt_rows:
+        wv, wp, wda, wrt = _coord_fallback_from_words()
+        if not t1_volume_rows and wv:
+            t1_volume_rows = wv
+            diagnostics.append(_diag(source_file, "table1_volume_source", "INFO", "source=coordinate_fallback(words)", len(t1_volume_rows)))
+        if not t1_price_rows and wp:
+            t1_price_rows = wp
+            diagnostics.append(_diag(source_file, "table1_price_source", "INFO", "source=coordinate_fallback(words)", len(t1_price_rows)))
+        if not t2_da_rows and wda:
+            t2_da_rows = wda
+            diagnostics.append(_diag(source_file, "table2_da_source", "INFO", "source=coordinate_fallback(words)", len(t2_da_rows)))
+        if not t2_rt_rows and wrt:
+            t2_rt_rows = wrt
+            diagnostics.append(_diag(source_file, "table2_rt_source", "INFO", "source=coordinate_fallback(words)", len(t2_rt_rows)))
 
     return GuangdongDailyExtractionResult("guangdong_daily", operation_date, market_rows, t1_volume_rows, t1_price_rows, t2_da_rows, t2_rt_rows, diagnostics)
 
@@ -2560,6 +2763,10 @@ def main() -> int:
 
     batch_mode = len(input_pdfs) > 1 or args.input_path.is_dir()
     failures = 0
+    gd_market_all: List[Dict[str, Any]] = []
+    gd_t1_all: List[Dict[str, Any]] = []
+    gd_t2_all: List[Dict[str, Any]] = []
+    gd_processed: List[Path] = []
 
     for input_pdf in input_pdfs:
         try:
@@ -2624,7 +2831,12 @@ def main() -> int:
             elif guangdong_daily_report:
                 raw_text, _page_texts = get_pdf_full_text_or_pages(str(input_pdf))
                 gd_result = extract_guangdong_daily_report(str(input_pdf), input_pdf.name, raw_text, extracted)
-                write_guangdong_daily_excel(output_path, gd_result)
+                if batch_mode:
+                    m_rows, t1_rows, t2_rows = build_guangdong_daily_long_rows(gd_result)
+                    gd_market_all.extend(m_rows); gd_t1_all.extend(t1_rows); gd_t2_all.extend(t2_rows)
+                    gd_processed.append(input_pdf)
+                else:
+                    write_guangdong_daily_excel(output_path, gd_result)
                 if args.verbose:
                     for diag in gd_result.diagnostics:
                         log(f"[GuangdongDaily] {diag.get('status','')} {diag.get('stage','')}: {diag.get('message','')}", args.verbose)
@@ -2638,10 +2850,16 @@ def main() -> int:
                     table_sheet_base_name="附表1" if monthly_report else "Table",
                     table_write_header=not monthly_report,
                 )
-            print(f"[OK] {input_pdf.name}: saved {len(extracted)} table(s) to {output_path}")
+            if not (batch_mode and guangdong_daily_report):
+                print(f"[OK] {input_pdf.name}: saved {len(extracted)} table(s) to {output_path}")
         except Exception as exc:
             print(f"[FAILED] {input_pdf}: {exc}", file=sys.stderr)
             failures += 1
+
+    if gd_processed:
+        summary_path = (args.output_dir or (args.input_path / "extracted_tables")) / "广东电力现货市场运行日报_汇总.xlsx"
+        write_guangdong_daily_summary_workbook(summary_path, gd_market_all, gd_t1_all, gd_t2_all)
+        print(f"[OK] Guangdong daily consolidated workbook: {summary_path}")
 
     if failures == len(input_pdfs):
         return 2
