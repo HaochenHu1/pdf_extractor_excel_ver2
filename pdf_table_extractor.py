@@ -2262,13 +2262,15 @@ def write_guangdong_daily_excel(output_path: Path, result: GuangdongDailyExtract
 
 def _split_price_time(value: str) -> Tuple[str, str]:
     txt = normalize_cell(value)
-    m = re.match(r"^\s*([-+]?\d+(?:\.\d+)?)\s*[（(]?(\d{1,2}:\d{2})?[）)]?\s*$", txt)
-    if m:
-        return m.group(1), m.group(2) or ""
-    m2 = re.match(r"^\s*([-+]?\d+(?:\.\d+)?)\((\d{1,2}:\d{2})\)\s*$", txt)
-    if m2:
-        return m2.group(1), m2.group(2)
-    return txt, ""
+    norm = txt.replace("：", ":")
+    tm = ""
+    mt = re.search(r"(\d{1,2}:\d{2})", norm)
+    if mt:
+        tm = mt.group(1)
+    mv = re.search(r"[-+]?\d+(?:\.\d+)?", norm)
+    if mv:
+        return mv.group(0), tm
+    return norm, tm
 
 
 def build_guangdong_daily_long_rows(result: GuangdongDailyExtractionResult) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
