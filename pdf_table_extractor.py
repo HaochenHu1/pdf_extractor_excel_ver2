@@ -2260,6 +2260,51 @@ def write_guangdong_daily_excel(output_path: Path, result: GuangdongDailyExtract
         pd.DataFrame(result.diagnostics).to_excel(writer, index=False, sheet_name="_diagnostics")
 
 
+def _split_price_time(value: str) -> Tuple[str, str]:
+    txt = normalize_cell(value)
+    m = re.match(r"^\s*([-+]?\d+(?:\.\d+)?)\s*[（(]?(\d{1,2}:\d{2})?[）)]?\s*$", txt)
+    if m:
+        return m.group(1), m.group(2) or ""
+    m2 = re.match(r"^\s*([-+]?\d+(?:\.\d+)?)\((\d{1,2}:\d{2})\)\s*$", txt)
+    if m2:
+        return m2.group(1), m2.group(2)
+    return txt, ""
+
+
+def build_guangdong_daily_long_rows(result: GuangdongDailyExtractionResult) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    market_rows: List[Dict[str, Any]] = []
+    t1_rows: List[Dict[str, Any]] = []
+    t2_rows: List[Dict[str, Any]] = []
+    for r in result.market_rows:
+        if r.get("statement_type") != "metric":
+            continue
+        metric_name = str(r.get("metric_name", "") or "")
+        side = str(r.get("side", "") or "")
+        fuel = str(r.get("fuel_type", "") or "")
+        type_name = f"{side}{metric_name}" if side else (f"{fuel}{metric_name}" if fuel else metric_name)
+        market_rows.append({"date": str(r.get("date", "") or "").replace("-", "/"), "type": type_name, "value": r.get("value", ""), "unit": normalize_unit_text(str(r.get("unit", "") or ""))})
+    for r in result.table1_volume_rows:
+        t1_rows.append({"date": str(result.operation_date or "").replace("-", "/"), "section": "日前成交电量", "side": r.get("side", ""), "sub_indicator": r.get("category", ""), "time_or_price_point": "", "value": r.get("value", ""), "unit": "亿kWh"})
+    for r in result.table1_price_rows:
+        v, tm = _split_price_time(str(r.get("price", "") or ""))
+        metric = str(r.get("metric", "") or "")
+        t1_rows.append({"date": str(r.get("table_operation_date", "") or result.operation_date or "").replace("-", "/"), "section": "日前成交电价", "side": r.get("side_or_fuel", ""), "sub_indicator": metric, "time_or_price_point": tm if metric in {"最高电价", "最低电价"} else "", "value": v, "unit": "%" if metric == "电价环比" else "厘/千瓦时"})
+    for section_name, rows in [("日前成交电价", result.table2_day_ahead_price_rows), ("实时成交电价", result.table2_realtime_price_rows)]:
+        for r in rows:
+            v, tm = _split_price_time(str(r.get("price", "") or ""))
+            metric = str(r.get("metric", "") or "")
+            t2_rows.append({"date": str(r.get("table_operation_date", "") or result.operation_date or "").replace("-", "/"), "section": section_name, "side": r.get("side_or_fuel", ""), "sub_indicator": metric, "time_or_price_point": tm if metric in {"最高电价", "最低电价"} else "", "value": v, "unit": "%" if metric == "电价环比" else "厘/千瓦时"})
+    return market_rows, t1_rows, t2_rows
+
+
+def write_guangdong_daily_summary_workbook(output_path: Path, market_rows: List[Dict[str, Any]], t1_rows: List[Dict[str, Any]], t2_rows: List[Dict[str, Any]]) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        pd.DataFrame(market_rows, columns=["date", "type", "value", "unit"]).to_excel(writer, index=False, sheet_name="市场交易情况")
+        pd.DataFrame(t1_rows, columns=["date", "section", "side", "sub_indicator", "time_or_price_point", "value", "unit"]).to_excel(writer, index=False, sheet_name="表1_运行日前交易情况")
+        pd.DataFrame(t2_rows, columns=["date", "section", "side", "sub_indicator", "time_or_price_point", "value", "unit"]).to_excel(writer, index=False, sheet_name="表2_运行日现货交易情况")
+
+
 def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, tables: Sequence[ExtractedTable]) -> GuangdongDailyExtractionResult:
     diagnostics: List[Dict[str, Any]] = [_diag(source_file, "detect", "INFO", f"检测广东日报: {source_file}", 0)]
     if not tables:
@@ -2654,6 +2699,10 @@ def main() -> int:
 
     batch_mode = len(input_pdfs) > 1 or args.input_path.is_dir()
     failures = 0
+    gd_market_all: List[Dict[str, Any]] = []
+    gd_t1_all: List[Dict[str, Any]] = []
+    gd_t2_all: List[Dict[str, Any]] = []
+    gd_processed: List[Path] = []
 
     for input_pdf in input_pdfs:
         try:
@@ -2718,7 +2767,12 @@ def main() -> int:
             elif guangdong_daily_report:
                 raw_text, _page_texts = get_pdf_full_text_or_pages(str(input_pdf))
                 gd_result = extract_guangdong_daily_report(str(input_pdf), input_pdf.name, raw_text, extracted)
-                write_guangdong_daily_excel(output_path, gd_result)
+                if batch_mode:
+                    m_rows, t1_rows, t2_rows = build_guangdong_daily_long_rows(gd_result)
+                    gd_market_all.extend(m_rows); gd_t1_all.extend(t1_rows); gd_t2_all.extend(t2_rows)
+                    gd_processed.append(input_pdf)
+                else:
+                    write_guangdong_daily_excel(output_path, gd_result)
                 if args.verbose:
                     for diag in gd_result.diagnostics:
                         log(f"[GuangdongDaily] {diag.get('status','')} {diag.get('stage','')}: {diag.get('message','')}", args.verbose)
@@ -2732,10 +2786,16 @@ def main() -> int:
                     table_sheet_base_name="附表1" if monthly_report else "Table",
                     table_write_header=not monthly_report,
                 )
-            print(f"[OK] {input_pdf.name}: saved {len(extracted)} table(s) to {output_path}")
+            if not (batch_mode and guangdong_daily_report):
+                print(f"[OK] {input_pdf.name}: saved {len(extracted)} table(s) to {output_path}")
         except Exception as exc:
             print(f"[FAILED] {input_pdf}: {exc}", file=sys.stderr)
             failures += 1
+
+    if gd_processed:
+        summary_path = (args.output_dir or (args.input_path / "extracted_tables")) / "广东电力现货市场运行日报_汇总.xlsx"
+        write_guangdong_daily_summary_workbook(summary_path, gd_market_all, gd_t1_all, gd_t2_all)
+        print(f"[OK] Guangdong daily consolidated workbook: {summary_path}")
 
     if failures == len(input_pdfs):
         return 2
