@@ -117,14 +117,29 @@ def build_market_trading_rows(section_text: str, source_file: str) -> List[Dict[
                     rec = base.copy()
                     rec.update({"statement_type": "metric", "metric_name": "日前成交电量", "value": mm.group(1), "unit": mm.group(2), "fuel_type": fuel})
                     rows.append(rec)
-            hi = re.search(rf"最高([0-9]+(?:\.[0-9]+)?)\s*{unit_pat}", body)
-            lo = re.search(rf"最低([0-9]+(?:\.[0-9]+)?)\s*{unit_pat}", body)
+            hi = re.search(rf"最高([\-]?[0-9]+(?:\.[0-9]+)?)\s*{unit_pat}", body)
+            lo = re.search(rf"最低([\-]?[0-9]+(?:\.[0-9]+)?)\s*{unit_pat}", body)
             if hi:
                 rec = base.copy(); rec.update({"statement_type": "metric", "metric_name": "日前机组成交价最高", "value": hi.group(1), "unit": hi.group(2)})
                 rows.append(rec)
             if lo:
                 rec = base.copy(); rec.update({"statement_type": "metric", "metric_name": "日前机组成交价最低", "value": lo.group(1), "unit": lo.group(2)})
                 rows.append(rec)
+            extra_price_patterns = [
+                (r"(日前加权平均电价)\s*([\-]?\d+(?:\.\d+)?)\s*(厘/千瓦时)", ""),
+                (r"(实时加权平均电价)\s*([\-]?\d+(?:\.\d+)?)\s*(厘/千瓦时)", ""),
+                (r"(燃煤均价)\s*([\-]?\d+(?:\.\d+)?)\s*(厘/千瓦时)", ""),
+                (r"(燃气均价)\s*([\-]?\d+(?:\.\d+)?)\s*(厘/千瓦时)", ""),
+                (r"(日前机组成交价最高)\s*([\-]?\d+(?:\.\d+)?)\s*(厘/千瓦时)", ""),
+                (r"(日前机组成交价最低)\s*([\-]?\d+(?:\.\d+)?)\s*(厘/千瓦时)", ""),
+                (r"(实时机组成交价最高)\s*([\-]?\d+(?:\.\d+)?)\s*(厘/千瓦时)", ""),
+                (r"(实时机组成交价最低)\s*([\-]?\d+(?:\.\d+)?)\s*(厘/千瓦时)", ""),
+            ]
+            for pat, side in extra_price_patterns:
+                for pm in re.finditer(pat, body):
+                    rec = base.copy()
+                    rec.update({"statement_type": "metric", "metric_name": pm.group(1), "value": pm.group(2), "unit": pm.group(3), "side": side})
+                    rows.append(rec)
     return rows
 
 
