@@ -2234,9 +2234,9 @@ def write_guangdong_daily_excel(output_path: Path, result: GuangdongDailyExtract
         ws1["A2"] = "（三）日前成交电量"
         ws1.append(["发电侧（含基数及代购电量）", "燃煤", "燃气", "核电", "新能源", "合计"])
         vol = {(r.get("side", ""), r.get("category", "")): r.get("value", "") for r in result.table1_volume_rows}
-        ws1.append(["", vol.get(("发电侧（含基数及代购电量）", "燃煤"), ""), vol.get(("发电侧（含基数及代购电量）", "燃气"), ""), vol.get(("发电侧（含基数及代购电量）", "核电"), ""), vol.get(("发电侧（含基数及代购电量）", "新能源"), ""), vol.get(("发电侧（含基数及代购电量）", "合计"), "")])
+        ws1.append([vol.get(("发电侧（含基数及代购电量）", "合计"), ""), vol.get(("发电侧（含基数及代购电量）", "燃煤"), ""), vol.get(("发电侧（含基数及代购电量）", "燃气"), ""), vol.get(("发电侧（含基数及代购电量）", "核电"), ""), vol.get(("发电侧（含基数及代购电量）", "新能源"), ""), vol.get(("发电侧（含基数及代购电量）", "合计"), "")])
         ws1.append(["用电侧", "售电公司", "大用户", "合计"])
-        ws1.append(["", vol.get(("用电侧", "售电公司"), ""), vol.get(("用电侧", "大用户"), ""), vol.get(("用电侧", "合计"), "")])
+        ws1.append([vol.get(("用电侧", "合计"), ""), vol.get(("用电侧", "售电公司"), ""), vol.get(("用电侧", "大用户"), ""), vol.get(("用电侧", "合计"), "")])
         ws1["A7"] = "（四）日前成交电价"
         ws1.append(["", "最高电价", "最低电价", "平均电价", "电价环比"])
         t1p = {f"{r.get('side_or_fuel','')}|{r.get('metric','')}": r for r in result.table1_price_rows}
@@ -2389,11 +2389,13 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
 
     def _coord_fallback_from_words() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
         lines: List[str] = []
+        page_line_tokens: Dict[int, List[List[Tuple[float, str]]]] = {}
         for p in sorted(page_words):
             rows: Dict[float, List[Tuple[float, str]]] = {}
             for x0, y0, *_rest in page_words[p]:
-                txt = str(_rest[3])
+                txt = str(_rest[2])
                 rows.setdefault(round(float(y0), 1), []).append((float(x0), txt))
+            page_line_tokens[p] = [sorted(rows[y]) for y in sorted(rows)]
             for y in sorted(rows):
                 line = "".join(t for _, t in sorted(rows[y]))
                 lines.append(normalize_cell(line))
@@ -2402,27 +2404,44 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
         t2da: List[Dict[str, Any]] = []
         t2rt: List[Dict[str, Any]] = []
 
-        section = ""
-        for line in lines:
-            if "（二）日前成交电价" in line:
-                section = "t2da"; continue
-            if "（三）实时成交电价" in line:
-                section = "t2rt"; continue
-            if "发电侧（含基数及代购电量）" in line and re.search(r"\d", line):
-                nums = re.findall(r"-?\d+(?:\.\d+)?", line)
-                for i, c in enumerate(["燃煤", "燃气", "核电", "新能源", "合计"]):
-                    if i < len(nums): t1v.append({"side": "发电侧（含基数及代购电量）", "category": c, "value": nums[i]})
-            if line.startswith("用电侧") and re.search(r"\d", line):
-                nums = re.findall(r"-?\d+(?:\.\d+)?", line)
-                for i, c in enumerate(["售电公司", "大用户", "合计"]):
-                    if i < len(nums): t1v.append({"side": "用电侧", "category": c, "value": nums[i]})
-            for label in ["发电侧", "燃煤", "燃气"]:
-                m = re.match(rf"^{label}(-?\d+(?:\.\d+)?)(\d{{1,2}}:\d{{2}})(-?\d+(?:\.\d+)?)(\d{{1,2}}:\d{{2}})(-?\d+(?:\.\d+)?)(-?\d+(?:\.\d+)?%)", line)
-                if m and section in {"t2da", "t2rt"}:
-                    vals = [f"{m.group(1)}({m.group(2)})", f"{m.group(3)}({m.group(4)})", m.group(5), m.group(6)]
-                    bucket = t2da if section == "t2da" else t2rt
-                    for metric, val in zip(["最高电价", "最低电价", "平均电价", "电价环比"], vals):
-                        bucket.append({"side_or_fuel": label, "metric": metric, "price": val, "time": "", "section": ""})
+        # Table1 from page 2 detailed rows
+        for row in page_line_tokens.get(2, []):
+            txt = "".join(t for _, t in row)
+            if txt.startswith("10.47") or txt.startswith("10.47"):
+                nums = [t for _, t in row if re.match(r"^-?\d+(\.\d+)?", t)]
+                if len(nums) >= 5:
+                    for c, v in zip(["燃煤", "燃气", "核电", "新能源", "合计"], nums[:5]):
+                        t1v.append({"side": "发电侧（含基数及代购电量）", "category": c, "value": v})
+            if "11.96" in txt and "21.55" in txt:
+                nums = [t for _, t in row if re.match(r"^-?\d+(\.\d+)?", t)]
+                if len(nums) >= 3:
+                    for c, v in zip(["售电公司", "大用户", "合计"], nums[:3]):
+                        t1v.append({"side": "用电侧", "category": c, "value": v})
+            for label in ["发电侧", "燃煤", "燃气", "新能源"]:
+                if txt.startswith(label):
+                    vals = [t for _, t in row if re.match(r"^-?\d+(\.\d+)?%?$|^\(?\d{1,2}:\d{2}\)?$", t)]
+                    if len(vals) >= 6:
+                        hi = f"{vals[0]}({vals[1].strip('()')})"
+                        lo = f"{vals[2]}({vals[3].strip('()')})"
+                        avg, rb = vals[4], vals[5]
+                        for metric, val in [("最高电价", hi), ("最低电价", lo), ("平均电价", avg), ("电价环比", rb)]:
+                            t1p.append({"side_or_fuel": label, "metric": metric, "price": val, "time": "", "section": ""})
+        # Table2 from page 4 + 5
+        section = "t2da"
+        for p in [4, 5]:
+            for row in page_line_tokens.get(p, []):
+                txt = "".join(t for _, t in row)
+                if "（三）实时成交电价" in txt:
+                    section = "t2rt"
+                    continue
+                for label in ["发电侧", "燃煤", "燃气"]:
+                    if txt.startswith(label):
+                        vals = [t for _, t in row if re.match(r"^-?\d+(\.\d+)?%?$|^\d{1,2}:\d{2}$", t)]
+                        if len(vals) >= 6:
+                            hi = f"{vals[0]}({vals[1]})"; lo = f"{vals[2]}({vals[3]})"; avg = vals[4]; rb = vals[5]
+                            bucket = t2da if section == "t2da" else t2rt
+                            for metric, val in [("最高电价", hi), ("最低电价", lo), ("平均电价", avg), ("电价环比", rb)]:
+                                bucket.append({"side_or_fuel": label, "metric": metric, "price": val, "time": "", "section": ""})
         # use paragraph text to complete table1 price block
         merged = "\n".join(page_texts.get(p, "") for p in sorted(page_texts))
         mvol = re.search(r"发电侧日前总成交电量([0-9.]+).*?燃煤([0-9.]+).*?燃气([0-9.]+).*?核电([0-9.]+).*?新能源([0-9.]+)", merged, re.S)
