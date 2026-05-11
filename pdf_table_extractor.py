@@ -2307,10 +2307,60 @@ def build_guangdong_daily_long_rows(result: GuangdongDailyExtractionResult) -> T
 
 def write_guangdong_daily_summary_workbook(output_path: Path, market_rows: List[Dict[str, Any]], t1_rows: List[Dict[str, Any]], t2_rows: List[Dict[str, Any]]) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        pd.DataFrame(market_rows, columns=["date", "type", "value", "unit"]).to_excel(writer, index=False, sheet_name="市场交易情况")
-        pd.DataFrame(t1_rows, columns=["date", "section", "side", "sub_indicator", "time_or_price_point", "value", "unit"]).to_excel(writer, index=False, sheet_name="表1_运行日前交易情况")
-        pd.DataFrame(t2_rows, columns=["date", "section", "side", "sub_indicator", "time_or_price_point", "value", "unit"]).to_excel(writer, index=False, sheet_name="表2_运行日现货交易情况")
+    from openpyxl import Workbook
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    def _sorted_dates(rows: List[Dict[str, Any]]) -> List[str]:
+        return sorted({str(r.get("date", "")) for r in rows if str(r.get("date", ""))})
+
+    # Sheet1 simple wide
+    ws = wb.create_sheet("市场交易情况")
+    mdf = pd.DataFrame(market_rows)
+    metrics = sorted(mdf["type"].dropna().unique().tolist()) if not mdf.empty else []
+    ws["A2"] = "date"
+    for i, m in enumerate(metrics, start=2):
+        sub = mdf[mdf["type"] == m]
+        ws.cell(row=1, column=i).value = sub["unit"].dropna().iloc[0] if not sub.empty else ""
+        ws.cell(row=2, column=i).value = m
+    for r, d in enumerate(_sorted_dates(market_rows), start=3):
+        ws.cell(row=r, column=1).value = d
+        for i, m in enumerate(metrics, start=2):
+            sub = mdf[(mdf["date"] == d) & (mdf["type"] == m)]
+            ws.cell(row=r, column=i).value = sub["value"].iloc[0] if not sub.empty else ""
+
+    def _write_layered(sheet_name: str, rows: List[Dict[str, Any]]) -> None:
+        wsx = wb.create_sheet(sheet_name)
+        ddf = pd.DataFrame(rows)
+        if ddf.empty:
+            wsx["A4"] = "date"; return
+        ddf = ddf.copy()
+        ddf["date"] = ddf["date"].astype(str)
+        # add time columns for high/low
+        expanded = []
+        for _, r in ddf.iterrows():
+            base = dict(r)
+            expanded.append(base)
+            if str(r["sub_indicator"]) in {"最高电价", "最低电价"} and str(r.get("time_or_price_point", "")):
+                expanded.append({"date": r["date"], "section": r["section"], "side": r["side"], "sub_indicator": f"{r['sub_indicator']}时间", "time_or_price_point": "", "value": r["time_or_price_point"], "unit": "time"})
+        edf = pd.DataFrame(expanded)
+        keys = sorted({(a, b, c) for a, b, c in zip(edf["section"], edf["side"], edf["sub_indicator"])})
+        wsx["A4"] = "date"
+        for i, (sec, side, sub) in enumerate(keys, start=2):
+            unit = edf[(edf["section"] == sec) & (edf["side"] == side) & (edf["sub_indicator"] == sub)]["unit"].iloc[0]
+            wsx.cell(row=1, column=i).value = unit
+            wsx.cell(row=2, column=i).value = sec
+            wsx.cell(row=3, column=i).value = side
+            wsx.cell(row=4, column=i).value = sub
+        for r, d in enumerate(sorted(edf["date"].unique().tolist()), start=5):
+            wsx.cell(row=r, column=1).value = d
+            for i, (sec, side, sub) in enumerate(keys, start=2):
+                subdf = edf[(edf["date"] == d) & (edf["section"] == sec) & (edf["side"] == side) & (edf["sub_indicator"] == sub)]
+                wsx.cell(row=r, column=i).value = subdf["value"].iloc[0] if not subdf.empty else ""
+
+    _write_layered("表1_运行日前交易情况", t1_rows)
+    _write_layered("表2_运行日现货交易情况", t2_rows)
+    wb.save(output_path)
 
 
 def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, tables: Sequence[ExtractedTable]) -> GuangdongDailyExtractionResult:
