@@ -2280,6 +2280,8 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
     t2_rt_rows: List[Dict[str, Any]] = []
 
     page_texts: Dict[int, str] = {}
+    table1_pages: List[int] = []
+    table2_pages: List[int] = []
     page_words: Dict[int, List[Tuple[Any, ...]]] = {}
     try:
         doc = fitz.open(pdf_path)
@@ -2287,6 +2289,10 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
             page = doc[pno]
             txt = page.get_text("text") or ""
             page_texts[pno + 1] = txt
+            if "表1" in txt:
+                table1_pages.append(pno + 1)
+            if "表2" in txt:
+                table2_pages.append(pno + 1)
             if "表1" in txt or "表2" in txt or "日前成交电价" in txt or "日前成交电量" in txt or "实时成交电价" in txt:
                 words = page.get_text("words") or []
                 page_words[pno + 1] = words
@@ -2294,6 +2300,7 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
         doc.close()
     except Exception as exc:
         diagnostics.append(_diag(source_file, "pymupdf_words", "WARN", f"PyMuPDF words提取失败: {exc}", 0))
+    diagnostics.append(_diag(source_file, "table_pages", "INFO", f"表1页码={sorted(set(table1_pages))}; 表2页码={sorted(set(table2_pages))}", 0))
 
     def _rows_dump(table: ExtractedTable) -> List[List[str]]:
         return [[normalize_cell(v) for v in row] for row in table.df.fillna("").values.tolist()]
@@ -2380,6 +2387,60 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
                         bucket.append({"side_or_fuel": label, "metric": m, "price": nums[i], "time": "", "section": sec})
         return t1v, t1p, t2da, t2rt, reasons
 
+    def _coord_fallback_from_words() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        lines: List[str] = []
+        for p in sorted(page_words):
+            rows: Dict[float, List[Tuple[float, str]]] = {}
+            for x0, y0, *_rest in page_words[p]:
+                txt = str(_rest[3])
+                rows.setdefault(round(float(y0), 1), []).append((float(x0), txt))
+            for y in sorted(rows):
+                line = "".join(t for _, t in sorted(rows[y]))
+                lines.append(normalize_cell(line))
+        t1v: List[Dict[str, Any]] = []
+        t1p: List[Dict[str, Any]] = []
+        t2da: List[Dict[str, Any]] = []
+        t2rt: List[Dict[str, Any]] = []
+
+        section = ""
+        for line in lines:
+            if "（二）日前成交电价" in line:
+                section = "t2da"; continue
+            if "（三）实时成交电价" in line:
+                section = "t2rt"; continue
+            if "发电侧（含基数及代购电量）" in line and re.search(r"\d", line):
+                nums = re.findall(r"-?\d+(?:\.\d+)?", line)
+                for i, c in enumerate(["燃煤", "燃气", "核电", "新能源", "合计"]):
+                    if i < len(nums): t1v.append({"side": "发电侧（含基数及代购电量）", "category": c, "value": nums[i]})
+            if line.startswith("用电侧") and re.search(r"\d", line):
+                nums = re.findall(r"-?\d+(?:\.\d+)?", line)
+                for i, c in enumerate(["售电公司", "大用户", "合计"]):
+                    if i < len(nums): t1v.append({"side": "用电侧", "category": c, "value": nums[i]})
+            for label in ["发电侧", "燃煤", "燃气"]:
+                m = re.match(rf"^{label}(-?\d+(?:\.\d+)?)(\d{{1,2}}:\d{{2}})(-?\d+(?:\.\d+)?)(\d{{1,2}}:\d{{2}})(-?\d+(?:\.\d+)?)(-?\d+(?:\.\d+)?%)", line)
+                if m and section in {"t2da", "t2rt"}:
+                    vals = [f"{m.group(1)}({m.group(2)})", f"{m.group(3)}({m.group(4)})", m.group(5), m.group(6)]
+                    bucket = t2da if section == "t2da" else t2rt
+                    for metric, val in zip(["最高电价", "最低电价", "平均电价", "电价环比"], vals):
+                        bucket.append({"side_or_fuel": label, "metric": metric, "price": val, "time": "", "section": ""})
+        # use paragraph text to complete table1 price block
+        merged = "\n".join(page_texts.get(p, "") for p in sorted(page_texts))
+        mvol = re.search(r"发电侧日前总成交电量([0-9.]+).*?燃煤([0-9.]+).*?燃气([0-9.]+).*?核电([0-9.]+).*?新能源([0-9.]+)", merged, re.S)
+        if mvol:
+            vals = [mvol.group(i) for i in [2,3,4,5]]
+            for c,v in zip(["燃煤","燃气","核电","新能源"], vals):
+                t1v.append({"side":"发电侧（含基数及代购电量）","category":c,"value":v})
+        mu = re.search(r"用电侧日前总成交电量([0-9.]+)", merged)
+        if mu:
+            t1v.append({"side":"用电侧","category":"合计","value":mu.group(1)})
+        mhilo = re.search(r"价最高(-?\d+(?:\.\d+)?).*?最低(-?\d+(?:\.\d+)?)", merged, re.S)
+        mavg = re.search(r"发电侧日前总成交电量.*?日前加权平均电价(-?\d+(?:\.\d+)?).*?燃煤均价(-?\d+(?:\.\d+)?).*?燃气均价(-?\d+(?:\.\d+)?)", merged, re.S)
+        if mhilo and mavg:
+            for label,avg in [("发电侧",mavg.group(1)),("燃煤",mavg.group(2)),("燃气",mavg.group(3)),("新能源","")]:
+                for metric,val in [("最高电价",mhilo.group(1)),("最低电价",mhilo.group(2)),("平均电价",avg),("电价环比","")]:
+                    t1p.append({"side_or_fuel":label,"metric":metric,"price":val,"time":"","section":"（四）日前成交电价"})
+        return t1v, t1p, t2da, t2rt
+
     if t1 is not None:
         raw_rows = _rows_dump(t1)
         diagnostics.append(_diag(source_file, "table1_raw_rows", "INFO", f"表1原始行: {raw_rows}", len(raw_rows)))
@@ -2422,6 +2483,20 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
         if not t2_rt_rows and frt:
             t2_rt_rows = frt
             diagnostics.append(_diag(source_file, "table2_rt_source", "INFO", "source=coordinate_fallback(page_text/words)", len(t2_rt_rows)))
+    if not t1_volume_rows or not t1_price_rows or not t2_da_rows or not t2_rt_rows:
+        wv, wp, wda, wrt = _coord_fallback_from_words()
+        if not t1_volume_rows and wv:
+            t1_volume_rows = wv
+            diagnostics.append(_diag(source_file, "table1_volume_source", "INFO", "source=coordinate_fallback(words)", len(t1_volume_rows)))
+        if not t1_price_rows and wp:
+            t1_price_rows = wp
+            diagnostics.append(_diag(source_file, "table1_price_source", "INFO", "source=coordinate_fallback(words)", len(t1_price_rows)))
+        if not t2_da_rows and wda:
+            t2_da_rows = wda
+            diagnostics.append(_diag(source_file, "table2_da_source", "INFO", "source=coordinate_fallback(words)", len(t2_da_rows)))
+        if not t2_rt_rows and wrt:
+            t2_rt_rows = wrt
+            diagnostics.append(_diag(source_file, "table2_rt_source", "INFO", "source=coordinate_fallback(words)", len(t2_rt_rows)))
 
     return GuangdongDailyExtractionResult("guangdong_daily", operation_date, market_rows, t1_volume_rows, t1_price_rows, t2_da_rows, t2_rt_rows, diagnostics)
 
