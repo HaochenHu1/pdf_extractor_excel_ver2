@@ -2273,6 +2273,12 @@ def _split_price_time(value: str) -> Tuple[str, str]:
     return norm, tm
 
 
+def _clean_volume_value(cell_text: str) -> str:
+    txt = normalize_cell(cell_text).replace("（", "(").replace("）", ")")
+    m = re.match(r"^\s*([-+]?\d+(?:\.\d+)?)", txt)
+    return m.group(1) if m else txt
+
+
 def build_guangdong_daily_long_rows(result: GuangdongDailyExtractionResult) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     market_rows: List[Dict[str, Any]] = []
     t1_rows: List[Dict[str, Any]] = []
@@ -2286,7 +2292,7 @@ def build_guangdong_daily_long_rows(result: GuangdongDailyExtractionResult) -> T
         type_name = f"{side}{metric_name}" if side else (f"{fuel}{metric_name}" if fuel else metric_name)
         market_rows.append({"date": str(r.get("date", "") or "").replace("-", "/"), "type": type_name, "value": r.get("value", ""), "unit": normalize_unit_text(str(r.get("unit", "") or ""))})
     for r in result.table1_volume_rows:
-        t1_rows.append({"date": str(result.operation_date or "").replace("-", "/"), "section": "日前成交电量", "side": r.get("side", ""), "sub_indicator": r.get("category", ""), "time_or_price_point": "", "value": r.get("value", ""), "unit": "亿kWh"})
+        t1_rows.append({"date": str(result.operation_date or "").replace("-", "/"), "section": "日前成交电量", "side": r.get("side", ""), "sub_indicator": r.get("category", ""), "time_or_price_point": "", "value": _clean_volume_value(str(r.get("value", "") or "")), "unit": "亿kWh"})
     for r in result.table1_price_rows:
         v, tm = _split_price_time(str(r.get("price", "") or ""))
         metric = str(r.get("metric", "") or "")
@@ -2452,16 +2458,22 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
         t2rt: List[Dict[str, Any]] = []
 
         # Table1 from page 2 detailed rows
-        for row in page_line_tokens.get(2, []):
+        t1_page = min(page_line_tokens.keys()) if page_line_tokens else 2
+        for p, prow in page_line_tokens.items():
+            joined = "".join("".join(t for _, t in r) for r in prow[:120])
+            if "（三）日前成交电量" in joined and "（四）日前成交电价" in joined:
+                t1_page = p
+                break
+        for row in page_line_tokens.get(t1_page, []):
             txt = "".join(t for _, t in row)
             if txt.startswith("10.47") or txt.startswith("10.47"):
                 nums = [t for _, t in row if re.match(r"^-?\d+(\.\d+)?", t)]
                 if len(nums) >= 5:
                     for c, v in zip(["燃煤", "燃气", "核电", "新能源", "合计"], nums[:5]):
                         t1v.append({"side": "发电侧（含基数及代购电量）", "category": c, "value": v})
-            if "11.96" in txt and "21.55" in txt:
+            if re.search(r"\d", txt) and "%" in txt and ":" not in txt:
                 nums = [t for _, t in row if re.match(r"^-?\d+(\.\d+)?", t)]
-                if len(nums) >= 3:
+                if len(nums) == 3:
                     for c, v in zip(["售电公司", "大用户", "合计"], nums[:3]):
                         t1v.append({"side": "用电侧", "category": c, "value": v})
             for label in ["发电侧", "燃煤", "燃气", "新能源"]:
