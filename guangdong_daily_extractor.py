@@ -40,17 +40,21 @@ def normalize_market_metric_terms(text: str) -> str:
     """
     t = "" if text is None else str(text)
     join = r"[\s/／\-]*"
+    # Also allow separators inside words, e.g. 燃煤均/价, 日前加权平/均电价.
+    def _flex_phrase(phrase: str) -> str:
+        return join.join(re.escape(ch) for ch in phrase)
+
     phrase_rewrites = [
-        (rf"发电侧{join}日前{join}总成交电量", "发电侧日前总成交电量"),
-        (rf"燃煤{join}日前{join}成交电量", "燃煤日前成交电量"),
-        (rf"燃气{join}日前{join}成交电量", "燃气日前成交电量"),
-        (rf"核电{join}日前{join}成交电量", "核电日前成交电量"),
-        (rf"新能源{join}日前{join}成交电量", "新能源日前成交电量"),
-        (rf"日前{join}加权{join}平均{join}电价", "日前加权平均电价"),
-        (rf"日前{join}机组{join}成交价{join}最低", "日前机组成交价最低"),
-        (rf"日前{join}机组{join}成交价{join}最高", "日前机组成交价最高"),
-        (rf"燃煤{join}均价", "燃煤均价"),
-        (rf"燃气{join}均价", "燃气均价"),
+        (_flex_phrase("发电侧日前总成交电量"), "发电侧日前总成交电量"),
+        (_flex_phrase("燃煤日前成交电量"), "燃煤日前成交电量"),
+        (_flex_phrase("燃气日前成交电量"), "燃气日前成交电量"),
+        (_flex_phrase("核电日前成交电量"), "核电日前成交电量"),
+        (_flex_phrase("新能源日前成交电量"), "新能源日前成交电量"),
+        (_flex_phrase("日前加权平均电价"), "日前加权平均电价"),
+        (_flex_phrase("日前机组成交价最低"), "日前机组成交价最低"),
+        (_flex_phrase("日前机组成交价最高"), "日前机组成交价最高"),
+        (_flex_phrase("燃煤均价"), "燃煤均价"),
+        (_flex_phrase("燃气均价"), "燃气均价"),
     ]
     for pat, repl in phrase_rewrites:
         t = re.sub(pat, repl, t, flags=re.IGNORECASE)
