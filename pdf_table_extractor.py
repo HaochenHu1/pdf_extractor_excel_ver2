@@ -2358,7 +2358,11 @@ def write_guangdong_daily_summary_workbook(output_path: Path, market_rows: List[
             wsx.cell(row=r, column=1).value = d
             for i, (sec, side, sub) in enumerate(keys, start=2):
                 subdf = edf[(edf["date"] == d) & (edf["section"] == sec) & (edf["side"] == side) & (edf["sub_indicator"] == sub)]
-                wsx.cell(row=r, column=i).value = subdf["value"].iloc[0] if not subdf.empty else ""
+                if subdf.empty:
+                    wsx.cell(row=r, column=i).value = ""
+                else:
+                    vals = [str(v).strip() for v in subdf["value"].tolist() if str(v).strip()]
+                    wsx.cell(row=r, column=i).value = vals[0] if vals else ""
 
     _write_layered("表1_运行日前交易情况", t1_rows)
     _write_layered("表2_运行日现货交易情况", t2_rows)
