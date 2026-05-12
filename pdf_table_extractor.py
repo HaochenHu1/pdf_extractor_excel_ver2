@@ -2287,6 +2287,8 @@ def build_guangdong_daily_long_rows(result: GuangdongDailyExtractionResult) -> T
         if r.get("statement_type") != "metric":
             continue
         metric_name = str(r.get("metric_name", "") or "")
+        if metric_name == "实时加权平均电价":
+            continue
         side = str(r.get("side", "") or "")
         fuel = str(r.get("fuel_type", "") or "")
         type_name = f"{side}{metric_name}" if side else (f"{fuel}{metric_name}" if fuel else metric_name)
