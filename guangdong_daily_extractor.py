@@ -80,6 +80,13 @@ def build_market_trading_rows(section_text: str, source_file: str) -> List[Dict[
     section_title = "二、市场交易情况"
     rows: List[Dict[str, Any]] = []
     normalized = normalize_chinese_whitespace(section_text)
+    # General anti-linebreak normalization for all market metrics.
+    # Make metric/value/unit regex matching robust to fragmented line breaks and spaces.
+    normalized = normalized.replace("\r", "\n")
+    normalized = re.sub(r"[ \t]*\n[ \t]*", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = re.sub(r"厘\s*/\s*千瓦时", "厘/千瓦时", normalized)
+    normalized = re.sub(r"亿\s*kWh", "亿kWh", normalized, flags=re.IGNORECASE)
     if not normalized:
         return rows
     for chunk in re.split(r"(?=（[一二三四五六七八九十]+）)", normalized):
@@ -97,6 +104,9 @@ def build_market_trading_rows(section_text: str, source_file: str) -> List[Dict[
             item_no = mt.group(1) if mt.lastindex and mt.lastindex >= 1 and mt.group(1) else ""
             body = mt.group(2) if mt.lastindex and mt.lastindex >= 2 and mt.group(2) else mt.group(0)
             body = body.strip(" 。")
+            body = re.sub(r"\s+", " ", body)
+            body = re.sub(r"厘\s*/\s*千瓦时", "厘/千瓦时", body)
+            body = re.sub(r"亿\s*kWh", "亿kWh", body, flags=re.IGNORECASE)
             # generic fallback row
             base = {
                 "source_file": source_file, "report_type": "guangdong_daily", "section_title": section_title,
@@ -127,8 +137,7 @@ def build_market_trading_rows(section_text: str, source_file: str) -> List[Dict[
                 rows.append(rec)
             extra_price_patterns = [
                 (r"(日前加权平均电价)\s*([\-]?\d+(?:\.\d+)?)\s*(厘/千瓦时)", ""),
-                (r"(实时加权平均电价)\s*([\-]?\d+(?:\.\d+)?)\s*(厘/千瓦时)", ""),
-                (r"(燃煤均价)\s*([\-]?\d+(?:\.\d+)?)\s*(厘/千瓦时)", ""),
+                                (r"(燃煤均价)\s*([\-]?\d+(?:\.\d+)?)\s*(厘/千瓦时)", ""),
                 (r"(燃气均价)\s*([\-]?\d+(?:\.\d+)?)\s*(厘/千瓦时)", ""),
                 (r"(日前机组成交价最高)\s*([\-]?\d+(?:\.\d+)?)\s*(厘/千瓦时)", ""),
                 (r"(日前机组成交价最低)\s*([\-]?\d+(?:\.\d+)?)\s*(厘/千瓦时)", ""),

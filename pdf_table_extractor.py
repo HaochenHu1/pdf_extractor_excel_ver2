@@ -2287,6 +2287,8 @@ def build_guangdong_daily_long_rows(result: GuangdongDailyExtractionResult) -> T
         if r.get("statement_type") != "metric":
             continue
         metric_name = str(r.get("metric_name", "") or "")
+        if metric_name == "实时加权平均电价":
+            continue
         side = str(r.get("side", "") or "")
         fuel = str(r.get("fuel_type", "") or "")
         type_name = f"{side}{metric_name}" if side else (f"{fuel}{metric_name}" if fuel else metric_name)
@@ -2356,7 +2358,11 @@ def write_guangdong_daily_summary_workbook(output_path: Path, market_rows: List[
             wsx.cell(row=r, column=1).value = d
             for i, (sec, side, sub) in enumerate(keys, start=2):
                 subdf = edf[(edf["date"] == d) & (edf["section"] == sec) & (edf["side"] == side) & (edf["sub_indicator"] == sub)]
-                wsx.cell(row=r, column=i).value = subdf["value"].iloc[0] if not subdf.empty else ""
+                if subdf.empty:
+                    wsx.cell(row=r, column=i).value = ""
+                else:
+                    vals = [str(v).strip() for v in subdf["value"].tolist() if str(v).strip()]
+                    wsx.cell(row=r, column=i).value = vals[0] if vals else ""
 
     _write_layered("表1_运行日前交易情况", t1_rows)
     _write_layered("表2_运行日现货交易情况", t2_rows)
@@ -2461,15 +2467,21 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
             reasons.append("section not found: 表1")
         if "表2" not in merged:
             reasons.append("section not found: 表2")
+        in_t1_vol = False
         for ln in merged.splitlines():
             line = normalize_cell(ln)
             if not line:
                 continue
+            if "（三）日前成交电量" in line:
+                in_t1_vol = True
+                continue
+            if "（四）日前成交电价" in line:
+                in_t1_vol = False
             nums = _numbers_from_line(line)
-            if "发电侧（含基数及代购电量）" in line and len(nums) >= 5:
+            if in_t1_vol and "发电侧（含基数及代购电量）" in line and len(nums) >= 5:
                 for i, c in enumerate(["燃煤", "燃气", "核电", "新能源", "合计"]):
                     t1v.append({"side": "发电侧（含基数及代购电量）", "category": c, "value": nums[i]})
-            if "用电侧" in line and len(nums) >= 3:
+            if in_t1_vol and "用电侧" in line and len(nums) >= 3:
                 for i, c in enumerate(["售电公司", "大用户", "合计"]):
                     t1v.append({"side": "用电侧", "category": c, "value": nums[i]})
             for label, bucket, sec in [
@@ -2514,14 +2526,20 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
             if "（三）日前成交电量" in joined and "（四）日前成交电价" in joined:
                 t1_page = p
                 break
+        in_t1_vol = False
         for row in page_line_tokens.get(t1_page, []):
             txt = "".join(t for _, t in row)
-            if txt.startswith("10.47") or txt.startswith("10.47"):
+            if "（三）日前成交电量" in txt:
+                in_t1_vol = True
+                continue
+            if "（四）日前成交电价" in txt:
+                in_t1_vol = False
+                continue
+            if in_t1_vol and re.search(r"\d", txt) and len([t for _, t in row if re.match(r"^-?\d+(\.\d+)?", t)]) >= 5:
                 nums = [t for _, t in row if re.match(r"^-?\d+(\.\d+)?", t)]
-                if len(nums) >= 5:
-                    for c, v in zip(["燃煤", "燃气", "核电", "新能源", "合计"], nums[:5]):
-                        t1v.append({"side": "发电侧（含基数及代购电量）", "category": c, "value": v})
-            if re.search(r"\d", txt) and "%" in txt and ":" not in txt:
+                for c, v in zip(["燃煤", "燃气", "核电", "新能源", "合计"], nums[:5]):
+                    t1v.append({"side": "发电侧（含基数及代购电量）", "category": c, "value": v})
+            if in_t1_vol and re.search(r"\d", txt) and "%" in txt and ":" not in txt:
                 nums = [t for _, t in row if re.match(r"^-?\d+(\.\d+)?", t)]
                 if len(nums) == 3:
                     for c, v in zip(["售电公司", "大用户", "合计"], nums[:3]):
@@ -2553,14 +2571,7 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
                                 bucket.append({"side_or_fuel": label, "metric": metric, "price": val, "time": "", "section": ""})
         # use paragraph text to complete table1 price block
         merged = "\n".join(page_texts.get(p, "") for p in sorted(page_texts))
-        mvol = re.search(r"发电侧日前总成交电量([0-9.]+).*?燃煤([0-9.]+).*?燃气([0-9.]+).*?核电([0-9.]+).*?新能源([0-9.]+)", merged, re.S)
-        if mvol:
-            vals = [mvol.group(i) for i in [2,3,4,5]]
-            for c,v in zip(["燃煤","燃气","核电","新能源"], vals):
-                t1v.append({"side":"发电侧（含基数及代购电量）","category":c,"value":v})
-        mu = re.search(r"用电侧日前总成交电量([0-9.]+)", merged)
-        if mu:
-            t1v.append({"side":"用电侧","category":"合计","value":mu.group(1)})
+        # Do NOT backfill 表1成交电量 from narrative text (can leak from other subsections).
         mhilo = re.search(r"价最高(-?\d+(?:\.\d+)?).*?最低(-?\d+(?:\.\d+)?)", merged, re.S)
         mavg = re.search(r"发电侧日前总成交电量.*?日前加权平均电价(-?\d+(?:\.\d+)?).*?燃煤均价(-?\d+(?:\.\d+)?).*?燃气均价(-?\d+(?:\.\d+)?)", merged, re.S)
         if mhilo and mavg:
@@ -2568,6 +2579,37 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
                 for metric,val in [("最高电价",mhilo.group(1)),("最低电价",mhilo.group(2)),("平均电价",avg),("电价环比","")]:
                     t1p.append({"side_or_fuel":label,"metric":metric,"price":val,"time":"","section":"（四）日前成交电价"})
         return t1v, t1p, t2da, t2rt
+
+    def _sanitize_t1_volume_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        allowed = {
+            ("发电侧（含基数及代购电量）", "燃煤"),
+            ("发电侧（含基数及代购电量）", "燃气"),
+            ("发电侧（含基数及代购电量）", "核电"),
+            ("发电侧（含基数及代购电量）", "新能源"),
+            ("发电侧（含基数及代购电量）", "合计"),
+            ("用电侧", "售电公司"),
+            ("用电侧", "大用户"),
+            ("用电侧", "合计"),
+        }
+        cleaned: List[Dict[str, Any]] = []
+        for r in rows:
+            side = str(r.get("side", "") or "")
+            cat = str(r.get("category", "") or "")
+            if (side, cat) not in allowed:
+                continue
+            vtxt = str(r.get("value", "") or "").strip()
+            m = re.match(r"^\s*(-?\d+(?:\.\d+)?)", vtxt)
+            if not m:
+                r["value"] = ""
+                cleaned.append(r)
+                continue
+            v = float(m.group(1))
+            # Guardrail against leakage from （二）日前申报信息-like large capacity values.
+            if v <= 0 or v > 200:
+                diagnostics.append(_diag(source_file, "table1_volume_guardrail", "WARN", f"Rejected out-of-scale value: {side}-{cat}={vtxt}", 0))
+                r["value"] = ""
+            cleaned.append(r)
+        return cleaned
 
     if t1 is not None:
         raw_rows = _rows_dump(t1)
@@ -2579,6 +2621,7 @@ def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, t
         t1_price_rows = extract_table1_day_ahead_price(source_file, t1.title or "表1", table_date, "", t1.df)
         if not t1_volume_rows:
             t1_volume_rows = _reconstruct_table1_volume(raw_rows)
+        t1_volume_rows = _sanitize_t1_volume_rows(t1_volume_rows)
         diagnostics.append(_diag(source_file, "table1_volume", "INFO" if t1_volume_rows else "WARN", "表1_日前成交电量提取完成" if t1_volume_rows else "表1_日前成交电量映射为空", len(t1_volume_rows)))
         diagnostics.append(_diag(source_file, "table1_price", "INFO", "表1_日前成交电价提取完成", len(t1_price_rows)))
     else:
