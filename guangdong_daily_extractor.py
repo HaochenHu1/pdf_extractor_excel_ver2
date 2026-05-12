@@ -33,6 +33,30 @@ def normalize_chinese_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", "" if text is None else str(text)).strip()
 
 
+def normalize_market_metric_terms(text: str) -> str:
+    """
+    Repair OCR/PDF-fragmented metric phrases in market-trading narrative text.
+    Keep this as a strict allowlist to avoid accidental over-normalization.
+    """
+    t = "" if text is None else str(text)
+    join = r"[\s/／\-]*"
+    phrase_rewrites = [
+        (rf"发电侧{join}日前{join}总成交电量", "发电侧日前总成交电量"),
+        (rf"燃煤{join}日前{join}成交电量", "燃煤日前成交电量"),
+        (rf"燃气{join}日前{join}成交电量", "燃气日前成交电量"),
+        (rf"核电{join}日前{join}成交电量", "核电日前成交电量"),
+        (rf"新能源{join}日前{join}成交电量", "新能源日前成交电量"),
+        (rf"日前{join}加权{join}平均{join}电价", "日前加权平均电价"),
+        (rf"日前{join}机组{join}成交价{join}最低", "日前机组成交价最低"),
+        (rf"日前{join}机组{join}成交价{join}最高", "日前机组成交价最高"),
+        (rf"燃煤{join}均价", "燃煤均价"),
+        (rf"燃气{join}均价", "燃气均价"),
+    ]
+    for pat, repl in phrase_rewrites:
+        t = re.sub(pat, repl, t, flags=re.IGNORECASE)
+    return t
+
+
 def is_guangdong_daily_report(filename: str) -> bool:
     normalized = normalize_chinese_whitespace(filename).replace("（", "(").replace("）", ")")
     pattern = (
@@ -87,6 +111,7 @@ def build_market_trading_rows(section_text: str, source_file: str) -> List[Dict[
     normalized = re.sub(r"\s+", " ", normalized)
     normalized = re.sub(r"厘\s*/\s*千瓦时", "厘/千瓦时", normalized)
     normalized = re.sub(r"亿\s*kWh", "亿kWh", normalized, flags=re.IGNORECASE)
+    normalized = normalize_market_metric_terms(normalized)
     if not normalized:
         return rows
     for chunk in re.split(r"(?=（[一二三四五六七八九十]+）)", normalized):
@@ -107,6 +132,7 @@ def build_market_trading_rows(section_text: str, source_file: str) -> List[Dict[
             body = re.sub(r"\s+", " ", body)
             body = re.sub(r"厘\s*/\s*千瓦时", "厘/千瓦时", body)
             body = re.sub(r"亿\s*kWh", "亿kWh", body, flags=re.IGNORECASE)
+            body = normalize_market_metric_terms(body)
             # generic fallback row
             base = {
                 "source_file": source_file, "report_type": "guangdong_daily", "section_title": section_title,
