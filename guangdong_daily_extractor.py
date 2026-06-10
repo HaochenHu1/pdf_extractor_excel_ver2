@@ -275,3 +275,221 @@ def attach_table_operation_date(rows: List[Dict[str, Any]], table_title: str) ->
     for r in rows:
         r["table_operation_date"] = d or ""
     return rows
+
+
+def _lines(text: str) -> List[str]:
+    return [normalize_chinese_whitespace(line) for line in (text or "").splitlines() if normalize_chinese_whitespace(line)]
+
+
+def _num_text(value: str) -> str:
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", normalize_chinese_whitespace(value))
+    return m.group(0) if m else ""
+
+
+def _percent_text(value: str) -> str:
+    m = re.search(r"[-+]?\d+(?:\.\d+)?\s*%", normalize_chinese_whitespace(value))
+    return m.group(0).replace(" ", "") if m else _num_text(value)
+
+
+def _section_between(text: str, start_pat: str, end_pat: str) -> str:
+    m = re.search(start_pat + r"([\s\S]*?)" + end_pat, text or "")
+    return m.group(1) if m else ""
+
+
+def _section_from(text: str, start_pat: str) -> str:
+    m = re.search(start_pat + r"([\s\S]*)", text or "")
+    return m.group(1) if m else ""
+
+
+def _parse_price_value(raw: str) -> Tuple[str, str, str]:
+    price, tm, source = split_price_and_time(raw)
+    return _num_text(price), tm, source
+
+
+def _parse_price_block(
+    source_file: str,
+    table_name: str,
+    table_date: Optional[str],
+    section: str,
+    block_text: str,
+    labels: Sequence[str],
+) -> List[Dict[str, Any]]:
+    """Parse one bounded price section only, preventing day-ahead/realtime leakage."""
+    rows: List[Dict[str, Any]] = []
+    block_lines = _lines(block_text)
+    metrics = ["最高电价", "最低电价", "平均电价", "电价环比"]
+    for idx, line in enumerate(block_lines):
+        if line not in labels:
+            continue
+        values = block_lines[idx + 1 : idx + 5]
+        if len(values) < 4:
+            continue
+        for metric, raw in zip(metrics, values):
+            if metric in {"最高电价", "最低电价"}:
+                price, tm, source = _parse_price_value(raw)
+            elif metric == "电价环比":
+                price, tm, source = _percent_text(raw), "", raw
+            else:
+                price, tm, source = _num_text(raw), "", raw
+            rows.append(
+                {
+                    "source_file": source_file,
+                    "table_name": table_name,
+                    "table_operation_date": table_date or "",
+                    "section": section,
+                    "side_or_fuel": line,
+                    "metric": metric,
+                    "price": price,
+                    "time": tm,
+                    "unit": "%" if metric == "电价环比" else "厘/千瓦时",
+                    "raw_text": source,
+                }
+            )
+    return rows
+
+
+def _parse_table1_volume(source_file: str, table_name: str, table_date: Optional[str], block_text: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    block_lines = _lines(block_text)
+    try:
+        start = block_lines.index("发电侧（含基数")
+    except ValueError:
+        return rows
+    nums: List[str] = []
+    for line in block_lines[start:]:
+        if line == "（四）日前成交电价":
+            break
+        if re.match(r"[-+]?\d+(?:\.\d*)?(?:\([^)]+\))?$", line):
+            nums.append(_num_text(line))
+    for category, value in zip(["燃煤", "燃气", "核电", "新能源", "合计"], nums[:5]):
+        rows.append(
+            {
+                "source_file": source_file,
+                "table_name": table_name,
+                "table_operation_date": table_date or "",
+                "section": "（三）日前成交电量",
+                "side": "发电侧（含基数及代购电量）",
+                "category": category,
+                "value": value,
+                "unit": "亿kWh",
+                "raw_text": value,
+            }
+        )
+    for category, value in zip(["售电公司", "大用户", "合计"], nums[5:8]):
+        rows.append(
+            {
+                "source_file": source_file,
+                "table_name": table_name,
+                "table_operation_date": table_date or "",
+                "section": "（三）日前成交电量",
+                "side": "用电侧",
+                "category": category,
+                "value": value,
+                "unit": "亿kWh",
+                "raw_text": value,
+            }
+        )
+    return rows
+
+
+def _market_metric_rows(section_text: str, source_file: str) -> List[Dict[str, Any]]:
+    """Sheet 1 boundary: 二、市场交易情况 -> （一）运行日现货日前交易情况 only."""
+    text = re.sub(r"\s+", "", section_text or "")
+    rows: List[Dict[str, Any]] = []
+
+    def add(metric_name: str, value: str, unit: str, side: str = "", fuel_type: str = "") -> None:
+        if value == "":
+            return
+        rows.append(
+            {
+                "source_file": source_file,
+                "report_type": "guangdong_daily",
+                "section_title": "二、市场交易情况",
+                "subsection_title": "（一）现货日前交易情况",
+                "item_no": "",
+                "statement_type": "metric",
+                "metric_name": metric_name,
+                "value": value,
+                "unit": unit,
+                "time": "",
+                "fuel_type": fuel_type,
+                "side": side,
+                "raw_text": section_text,
+            }
+        )
+
+    patterns = [
+        ("用电侧", "日前总成交电量", r"用电侧日前总成交电量([-+]?\d+(?:\.\d+)?)亿kWh", "亿kWh", ""),
+        ("发电侧", "日前总成交电量", r"发电侧日前总成交电量([-+]?\d+(?:\.\d+)?)亿kWh", "亿kWh", ""),
+        ("", "日前成交电量", r"燃煤([-+]?\d+(?:\.\d+)?)亿kWh", "亿kWh", "燃煤"),
+        ("", "日前成交电量", r"燃气([-+]?\d+(?:\.\d+)?)亿kWh", "亿kWh", "燃气"),
+        ("", "日前成交电量", r"核电([-+]?\d+(?:\.\d+)?)亿kWh", "亿kWh", "核电"),
+        ("", "日前成交电量", r"新能源([-+]?\d+(?:\.\d+)?)亿kWh", "亿kWh", "新能源"),
+        ("", "日前加权平均电价", r"日前加权平均电价([-+]?\d+(?:\.\d+)?)厘/千瓦时", "厘/千瓦时", ""),
+        ("", "燃煤均价", r"燃煤均价([-+]?\d+(?:\.\d+)?)厘/千瓦时", "厘/千瓦时", ""),
+        ("", "燃气均价", r"燃气均价([-+]?\d+(?:\.\d+)?)厘/千瓦时", "厘/千瓦时", ""),
+        ("", "日前机组成交价最高", r"价最高([-+]?\d+(?:\.\d+)?)厘/千瓦时", "厘/千瓦时", ""),
+        ("", "日前机组成交价最低", r"最低([-+]?\d+(?:\.\d+)?)厘/千瓦时", "厘/千瓦时", ""),
+    ]
+    for side, metric, pat, unit, fuel in patterns:
+        m = re.search(pat, text)
+        add(metric, m.group(1) if m else "", unit, side=side, fuel_type=fuel)
+    return rows
+
+
+def extract_guangdong_daily_from_text(source_file: str, text: str) -> GuangdongDailyExtractionResult:
+    """
+    Extract the three workbook targets from explicit text boundaries.
+
+    Boundaries:
+    - Sheet 1: 二、市场交易情况 -> （一）...现货日前交易情况, stopped before 表1.
+    - Sheet 2: 表1 ... 日前交易情况 -> （四）日前成交电价, with Table 1 date.
+    - Sheet 3: 表2 ... 现货交易情况 -> （二）日前成交电价 and （三）实时成交电价,
+      with the running day in the Table 2 title, even when it differs from the report date.
+    """
+    diagnostics: List[Dict[str, Any]] = [_diag(source_file, "detect", "INFO", f"检测广东日报: {source_file}", 0)]
+    report_date = extract_daily_report_operation_date(source_file, text)
+
+    market_block = _section_between(
+        text,
+        r"二、市场交易情况[\s\S]*?（一）\s*\d{1,2}\s*月\s*\d{1,2}\s*日（运行日）现货日前交易情况",
+        r"表1\s*运行日",
+    )
+    market_rows = _market_metric_rows(market_block, source_file)
+    for row in market_rows:
+        row["date"] = report_date or ""
+    diagnostics.append(_diag(source_file, "sheet1_market_block", "INFO" if market_block else "WARN", "找到Sheet1目标边界" if market_block else "缺少Sheet1目标边界", len(market_rows)))
+
+    table1_title = re.search(r"(表1\s*运行日\s*\d{4}[-年]\d{1,2}[-月]\d{1,2}\s*日前交易情况)", text or "")
+    table1_name = table1_title.group(1) if table1_title else "表1 运行日前交易情况"
+    table1_date = extract_table_operation_date_from_title(table1_name)
+    table1_text = _section_between(text, r"表1\s*运行日", r"表\d+\s*运行日\s*\d{4}[-年]\d{1,2}[-月]\d{1,2}\s*现货交易情况")
+    table1_volume_block = _section_between(table1_text, r"（三）日前成交电量", r"（四）日前成交电价")
+    table1_price_block = _section_from(table1_text, r"（四）日前成交电价")
+    table1_volume_rows = _parse_table1_volume(source_file, table1_name, table1_date, "（三）日前成交电量\n" + table1_volume_block + "\n（四）日前成交电价")
+    table1_price_rows = _parse_price_block(source_file, table1_name, table1_date, "（四）日前成交电价", table1_price_block, ["发电侧", "燃煤", "燃气", "新能源"])
+    diagnostics.append(_diag(source_file, "sheet2_table1_price", "INFO" if table1_price_rows else "WARN", "找到表1日前成交电价" if table1_price_rows else "表1日前成交电价为空", len(table1_price_rows)))
+
+    table2_title = re.search(r"(表\d+\s*运行日\s*\d{4}[-年]\d{1,2}[-月]\d{1,2}\s*现货交易情况)", text or "")
+    table2_name = table2_title.group(1) if table2_title else "表2 运行日现货交易情况"
+    table2_date = extract_table_operation_date_from_title(table2_name)
+    table2_text = _section_between(text, r"表\d+\s*运行日\s*\d{4}[-年]\d{1,2}[-月]\d{1,2}\s*现货交易情况", r"\n\s*三、市场结算情况")
+    t2_da_block = _section_between(table2_text, r"（二）日前成交电价", r"（三）实时成交电价")
+    t2_rt_block = _section_from(table2_text, r"（三）实时成交电价")
+    table2_day_ahead_rows = _parse_price_block(source_file, table2_name, table2_date, "（二）日前成交电价", t2_da_block, ["发电侧", "燃煤", "燃气"])
+    table2_realtime_rows = _parse_price_block(source_file, table2_name, table2_date, "（三）实时成交电价", t2_rt_block, ["发电侧", "燃煤", "燃气"])
+    diagnostics.append(_diag(source_file, "sheet3_table2_day_ahead", "INFO" if table2_day_ahead_rows else "WARN", "找到表2日前成交电价" if table2_day_ahead_rows else "表2日前成交电价为空", len(table2_day_ahead_rows)))
+    diagnostics.append(_diag(source_file, "sheet3_table2_realtime", "INFO" if table2_realtime_rows else "WARN", "找到表2实时成交电价" if table2_realtime_rows else "表2实时成交电价为空", len(table2_realtime_rows)))
+
+    if table2_date and report_date and table2_date != report_date:
+        diagnostics.append(_diag(source_file, "table2_running_day", "INFO", f"表2运行日{table2_date}不同于报告日期{report_date}", 0))
+    return GuangdongDailyExtractionResult(
+        "guangdong_daily",
+        report_date,
+        market_rows,
+        table1_volume_rows,
+        table1_price_rows,
+        table2_day_ahead_rows,
+        table2_realtime_rows,
+        diagnostics,
+    )

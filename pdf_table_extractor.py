@@ -36,6 +36,7 @@ from guangdong_daily_extractor import (
     extract_table1_day_ahead_volume,
     extract_table2_day_ahead_price,
     extract_table2_realtime_price,
+    extract_guangdong_daily_from_text,
     extract_table_operation_date_from_title,
     find_table_by_title,
     is_guangdong_daily_report,
@@ -2297,11 +2298,13 @@ def build_guangdong_daily_long_rows(result: GuangdongDailyExtractionResult) -> T
         t1_rows.append({"date": str(result.operation_date or "").replace("-", "/"), "section": "日前成交电量", "side": r.get("side", ""), "sub_indicator": r.get("category", ""), "time_or_price_point": "", "value": _clean_volume_value(str(r.get("value", "") or "")), "unit": "亿kWh"})
     for r in result.table1_price_rows:
         v, tm = _split_price_time(str(r.get("price", "") or ""))
+        tm = tm or str(r.get("time", "") or "")
         metric = str(r.get("metric", "") or "")
         t1_rows.append({"date": str(r.get("table_operation_date", "") or result.operation_date or "").replace("-", "/"), "section": "日前成交电价", "side": r.get("side_or_fuel", ""), "sub_indicator": metric, "time_or_price_point": tm if metric in {"最高电价", "最低电价"} else "", "value": v, "unit": "%" if metric == "电价环比" else "厘/千瓦时"})
     for section_name, rows in [("日前成交电价", result.table2_day_ahead_price_rows), ("实时成交电价", result.table2_realtime_price_rows)]:
         for r in rows:
             v, tm = _split_price_time(str(r.get("price", "") or ""))
+            tm = tm or str(r.get("time", "") or "")
             metric = str(r.get("metric", "") or "")
             t2_rows.append({"date": str(r.get("table_operation_date", "") or result.operation_date or "").replace("-", "/"), "section": section_name, "side": r.get("side_or_fuel", ""), "sub_indicator": metric, "time_or_price_point": tm if metric in {"最高电价", "最低电价"} else "", "value": v, "unit": "%" if metric == "电价环比" else "厘/千瓦时"})
     return market_rows, t1_rows, t2_rows
@@ -2310,66 +2313,206 @@ def build_guangdong_daily_long_rows(result: GuangdongDailyExtractionResult) -> T
 def write_guangdong_daily_summary_workbook(output_path: Path, market_rows: List[Dict[str, Any]], t1_rows: List[Dict[str, Any]], t2_rows: List[Dict[str, Any]]) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Border, Side
     wb = Workbook()
     wb.remove(wb.active)
 
     def _sorted_dates(rows: List[Dict[str, Any]]) -> List[str]:
         return sorted({str(r.get("date", "")) for r in rows if str(r.get("date", ""))})
 
-    # Sheet1 simple wide
-    ws = wb.create_sheet("市场交易情况")
-    mdf = pd.DataFrame(market_rows)
-    metrics = sorted(mdf["type"].dropna().unique().tolist()) if not mdf.empty else []
-    ws["A2"] = "date"
-    for i, m in enumerate(metrics, start=2):
-        sub = mdf[mdf["type"] == m]
-        ws.cell(row=1, column=i).value = sub["unit"].dropna().iloc[0] if not sub.empty else ""
-        ws.cell(row=2, column=i).value = m
-    for r, d in enumerate(_sorted_dates(market_rows), start=3):
-        ws.cell(row=r, column=1).value = d
-        for i, m in enumerate(metrics, start=2):
-            sub = mdf[(mdf["date"] == d) & (mdf["type"] == m)]
-            ws.cell(row=r, column=i).value = sub["value"].iloc[0] if not sub.empty else ""
+    def _to_number(value: Any) -> Any:
+        txt = str(value or "").strip().replace("%", "")
+        if not txt:
+            return ""
+        try:
+            return float(txt)
+        except ValueError:
+            return value
 
-    def _write_layered(sheet_name: str, rows: List[Dict[str, Any]]) -> None:
+    def _style_sheet(ws: Any) -> None:
+        thin = Side(style="thin", color="BFBFBF")
+        for row in ws.iter_rows():
+            for cell in row:
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+                if cell.row <= 4:
+                    cell.font = Font(bold=True)
+                    cell.fill = PatternFill("solid", fgColor="D9EAF7")
+        ws.freeze_panes = "B5"
+        for col in range(1, ws.max_column + 1):
+            ws.column_dimensions[get_column_letter(col)].width = 14 if col > 1 else 13
+
+    def _write_layered(sheet_name: str, rows: List[Dict[str, Any]], keys: List[Tuple[str, str, str, str]]) -> None:
         wsx = wb.create_sheet(sheet_name)
-        ddf = pd.DataFrame(rows)
-        if ddf.empty:
-            wsx["A4"] = "date"; return
-        ddf = ddf.copy()
-        ddf["date"] = ddf["date"].astype(str)
-        # add time columns for high/low
-        expanded = []
-        for _, r in ddf.iterrows():
-            base = dict(r)
-            expanded.append(base)
-            if str(r["sub_indicator"]) in {"最高电价", "最低电价"} and str(r.get("time_or_price_point", "")):
-                expanded.append({"date": r["date"], "section": r["section"], "side": r["side"], "sub_indicator": f"{r['sub_indicator']}时间", "time_or_price_point": "", "value": r["time_or_price_point"], "unit": "time"})
-        edf = pd.DataFrame(expanded)
-        keys = sorted({(a, b, c) for a, b, c in zip(edf["section"], edf["side"], edf["sub_indicator"])})
+        lookup: Dict[Tuple[str, str, str, str], Any] = {}
+        expanded: List[Dict[str, Any]] = []
+        for r in rows:
+            expanded.append(r)
+            if str(r.get("sub_indicator", "")) in {"最高电价", "最低电价"} and str(r.get("time_or_price_point", "")):
+                copy = dict(r)
+                copy["sub_indicator"] = f"{r['sub_indicator']}时间"
+                copy["value"] = r["time_or_price_point"]
+                copy["unit"] = "time"
+                expanded.append(copy)
+        for r in expanded:
+            date_key = str(r.get("date", ""))
+            key = (date_key, str(r.get("section", "")), str(r.get("side", "")), str(r.get("sub_indicator", "")))
+            lookup[key] = r.get("value", "")
         wsx["A4"] = "date"
-        for i, (sec, side, sub) in enumerate(keys, start=2):
-            unit = edf[(edf["section"] == sec) & (edf["side"] == side) & (edf["sub_indicator"] == sub)]["unit"].iloc[0]
+        for i, (unit, sec, side, sub) in enumerate(keys, start=2):
             wsx.cell(row=1, column=i).value = unit
             wsx.cell(row=2, column=i).value = sec
             wsx.cell(row=3, column=i).value = side
             wsx.cell(row=4, column=i).value = sub
-        for r, d in enumerate(sorted(edf["date"].unique().tolist()), start=5):
-            wsx.cell(row=r, column=1).value = d
-            for i, (sec, side, sub) in enumerate(keys, start=2):
-                subdf = edf[(edf["date"] == d) & (edf["section"] == sec) & (edf["side"] == side) & (edf["sub_indicator"] == sub)]
-                if subdf.empty:
-                    wsx.cell(row=r, column=i).value = ""
-                else:
-                    vals = [str(v).strip() for v in subdf["value"].tolist() if str(v).strip()]
-                    wsx.cell(row=r, column=i).value = vals[0] if vals else ""
+        for row_idx, d in enumerate(_sorted_dates(rows), start=5):
+            wsx.cell(row=row_idx, column=1).value = d
+            for col_idx, (_unit, sec, side, sub) in enumerate(keys, start=2):
+                value = lookup.get((d, sec, side, sub), "")
+                wsx.cell(row=row_idx, column=col_idx).value = value if sub.endswith("时间") else _to_number(value)
+        _style_sheet(wsx)
 
-    _write_layered("表1_运行日前交易情况", t1_rows)
-    _write_layered("表2_运行日现货交易情况", t2_rows)
+    # Sheet 1 keeps the old wide market layout and adds the missing 用电侧 metric at the end.
+    ws = wb.create_sheet("市场交易情况")
+    market_keys = [
+        ("亿kWh", "发电侧日前总成交电量"),
+        ("亿kWh", "新能源日前成交电量"),
+        ("厘/千瓦时", "日前加权平均电价"),
+        ("厘/千瓦时", "日前机组成交价最低"),
+        ("厘/千瓦时", "日前机组成交价最高"),
+        ("亿kWh", "核电日前成交电量"),
+        ("厘/千瓦时", "燃气均价"),
+        ("亿kWh", "燃气日前成交电量"),
+        ("厘/千瓦时", "燃煤均价"),
+        ("亿kWh", "燃煤日前成交电量"),
+        ("亿kWh", "用电侧日前总成交电量"),
+    ]
+    ws["A2"] = "date"
+    for i, (unit, metric) in enumerate(market_keys, start=2):
+        ws.cell(row=1, column=i).value = unit
+        ws.cell(row=2, column=i).value = metric
+    market_lookup = {(str(r.get("date", "")), str(r.get("type", ""))): r.get("value", "") for r in market_rows}
+    for r, d in enumerate(_sorted_dates(market_rows), start=3):
+        ws.cell(row=r, column=1).value = d
+        for i, (_unit, metric) in enumerate(market_keys, start=2):
+            ws.cell(row=r, column=i).value = _to_number(market_lookup.get((d, metric), ""))
+    _style_sheet(ws)
+
+    metric_order = ["平均电价", "最低电价", "最低电价时间", "最高电价", "最高电价时间", "电价环比"]
+    def price_keys(section: str, sides: List[str]) -> List[Tuple[str, str, str, str]]:
+        unit_for = {
+            "平均电价": "厘/千瓦时",
+            "最低电价": "厘/千瓦时",
+            "最低电价时间": "time",
+            "最高电价": "厘/千瓦时",
+            "最高电价时间": "time",
+            "电价环比": "%",
+        }
+        return [(unit_for[m], section, side, m) for side in sides for m in metric_order]
+
+    t1_keys = price_keys("日前成交电价", ["发电侧", "新能源", "燃气", "燃煤"]) + [
+        ("亿kWh", "日前成交电量", "发电侧（含基数及代购电量）", "合计"),
+        ("亿kWh", "日前成交电量", "发电侧（含基数及代购电量）", "新能源"),
+        ("亿kWh", "日前成交电量", "发电侧（含基数及代购电量）", "核电"),
+        ("亿kWh", "日前成交电量", "发电侧（含基数及代购电量）", "燃气"),
+        ("亿kWh", "日前成交电量", "发电侧（含基数及代购电量）", "燃煤"),
+        ("亿kWh", "日前成交电量", "用电侧", "合计"),
+        ("亿kWh", "日前成交电量", "用电侧", "售电公司"),
+        ("亿kWh", "日前成交电量", "用电侧", "大用户"),
+    ]
+    t2_keys = price_keys("实时成交电价", ["发电侧", "燃气", "燃煤"]) + price_keys("日前成交电价", ["发电侧", "燃气", "燃煤"])
+
+    _write_layered("表1_运行日前交易情况", t1_rows, t1_keys)
+    _write_layered("表2_运行日现货交易情况", t2_rows, t2_keys)
     wb.save(output_path)
 
 
+def write_guangdong_daily_validation_report(
+    report_path: Path,
+    output_path: Path,
+    old_workbook_path: Path,
+    diagnostics: List[Dict[str, Any]],
+    market_rows: List[Dict[str, Any]],
+    t1_rows: List[Dict[str, Any]],
+    t2_rows: List[Dict[str, Any]],
+) -> None:
+    from openpyxl import load_workbook
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def parseable(value: Any) -> bool:
+        txt = str(value or "").strip().replace("%", "")
+        if not txt:
+            return True
+        if re.match(r"^\d{1,2}:\d{2}$", txt):
+            return True
+        try:
+            float(txt)
+            return True
+        except ValueError:
+            return False
+
+    numeric_failures: List[str] = []
+    for bucket_name, rows in [("市场交易情况", market_rows), ("表1_运行日前交易情况", t1_rows), ("表2_运行日现货交易情况", t2_rows)]:
+        for row in rows:
+            value = row.get("value", "")
+            unit = row.get("unit", "")
+            if unit != "time" and not parseable(value):
+                numeric_failures.append(f"{bucket_name}: date={row.get('date')} field={row.get('type') or row.get('section')} value={value!r}")
+
+    comparison: List[str] = []
+    if old_workbook_path.exists() and output_path.exists():
+        old_wb = load_workbook(old_workbook_path, data_only=True)
+        new_wb = load_workbook(output_path, data_only=True)
+        for sheet in ["市场交易情况", "表1_运行日前交易情况", "表2_运行日现货交易情况"]:
+            if sheet not in old_wb.sheetnames or sheet not in new_wb.sheetnames:
+                comparison.append(f"{sheet}: sheet missing in one workbook")
+                continue
+            old_ws = old_wb[sheet]
+            new_ws = new_wb[sheet]
+            max_row = min(old_ws.max_row, new_ws.max_row)
+            max_col = min(old_ws.max_column, new_ws.max_column)
+            diffs = 0
+            examples: List[str] = []
+            for r in range(1, max_row + 1):
+                for c in range(1, max_col + 1):
+                    old_value = old_ws.cell(r, c).value
+                    new_value = new_ws.cell(r, c).value
+                    if str(old_value or "") != str(new_value or ""):
+                        diffs += 1
+                        if len(examples) < 8 and r > 2:
+                            examples.append(f"{old_ws.cell(4, c).value or old_ws.cell(2, c).value}@row{r}: old={old_value!r}, new={new_value!r}")
+            comparison.append(f"{sheet}: {diffs} differing common cells; examples: {'; '.join(examples) if examples else 'none'}")
+    else:
+        comparison.append(f"Old workbook not found for comparison: {old_workbook_path}")
+
+    processed = sorted({str(d.get("source_file", "")) for d in diagnostics if d.get("stage") == "detect"})
+    warnings = [d for d in diagnostics if str(d.get("status", "")).upper() == "WARN"]
+    lines = [
+        "广东电力现货市场运行日报 extraction validation",
+        f"output_workbook: {output_path}",
+        f"old_reference_workbook: {old_workbook_path}",
+        "",
+        f"processed_successfully_count: {len(processed)}",
+        "processed_successfully:",
+        *[f"- {name}" for name in processed],
+        "",
+        f"missing_target_sections_or_empty_blocks_count: {len(warnings)}",
+        *[f"- {d.get('source_file')} [{d.get('stage')}]: {d.get('message')} rows={d.get('rows_extracted')}" for d in warnings],
+        "",
+        f"empty_sheet_or_block_check: market_rows={len(market_rows)}, table1_rows={len(t1_rows)}, table2_rows={len(t2_rows)}",
+        "",
+        f"numeric_parse_failure_count: {len(numeric_failures)}",
+        *[f"- {item}" for item in numeric_failures[:200]],
+        "",
+        "comparison_against_old_workbook_pdf_is_source_of_truth:",
+        *[f"- {item}" for item in comparison],
+    ]
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def extract_guangdong_daily_report(pdf_path: str, source_file: str, text: str, tables: Sequence[ExtractedTable]) -> GuangdongDailyExtractionResult:
+    return extract_guangdong_daily_from_text(source_file, text)
+
     diagnostics: List[Dict[str, Any]] = [_diag(source_file, "detect", "INFO", f"检测广东日报: {source_file}", 0)]
     if not tables:
         diagnostics.append(_diag(source_file, "tables", "WARN", "未提取到表格，仅输出文本类结果", 0))
@@ -2810,6 +2953,7 @@ def main() -> int:
     gd_t1_all: List[Dict[str, Any]] = []
     gd_t2_all: List[Dict[str, Any]] = []
     gd_processed: List[Path] = []
+    gd_diagnostics_all: List[Dict[str, Any]] = []
 
     for input_pdf in input_pdfs:
         try:
@@ -2832,7 +2976,7 @@ def main() -> int:
                 if attach1_border_tables:
                     extracted = attach1_border_tables
 
-            if not extracted:
+            if not extracted and not guangdong_daily_report:
                 extracted = extract_tables_for_pdf(input_pdf, args)
             if not extracted and not guangdong_daily_report:
                 print(
@@ -2874,6 +3018,7 @@ def main() -> int:
             elif guangdong_daily_report:
                 raw_text, _page_texts = get_pdf_full_text_or_pages(str(input_pdf))
                 gd_result = extract_guangdong_daily_report(str(input_pdf), input_pdf.name, raw_text, extracted)
+                gd_diagnostics_all.extend(gd_result.diagnostics)
                 if batch_mode:
                     m_rows, t1_rows, t2_rows = build_guangdong_daily_long_rows(gd_result)
                     gd_market_all.extend(m_rows); gd_t1_all.extend(t1_rows); gd_t2_all.extend(t2_rows)
@@ -2902,7 +3047,11 @@ def main() -> int:
     if gd_processed:
         summary_path = (args.output_dir or (args.input_path / "extracted_tables")) / "广东电力现货市场运行日报_汇总.xlsx"
         write_guangdong_daily_summary_workbook(summary_path, gd_market_all, gd_t1_all, gd_t2_all)
+        validation_path = summary_path.with_name("广东电力现货市场运行日报_验证报告.txt")
+        old_reference_path = Path(__file__).resolve().parent / "广东电力现货市场运行日报_汇总.xlsx"
+        write_guangdong_daily_validation_report(validation_path, summary_path, old_reference_path, gd_diagnostics_all, gd_market_all, gd_t1_all, gd_t2_all)
         print(f"[OK] Guangdong daily consolidated workbook: {summary_path}")
+        print(f"[OK] Guangdong daily validation report: {validation_path}")
 
     if failures == len(input_pdfs):
         return 2
